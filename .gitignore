@@ -1,0 +1,10 @@
+# Built binaries (release artifacts, not source)
+/proxy/wsproxy
+/wsproxy
+/dist-release/
+/dist/site/
+
+# Local caches / editor files
+*.swp
+.DS_Store
+__pycache__/

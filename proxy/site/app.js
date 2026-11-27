@@ -1,0 +1,2179 @@
+// Hosts and settings live in localStorage (hosts.js); the password never does.
+const $ = (id) => document.getElementById(id);
+// the page's words in the visitor's language (i18n.js): the English given here, or its Chinese.
+// Log lines, options and technical values stay English.
+const t = (key, text, vars) => globalThis.FreeRDPi18n?.t(key, text, vars) ?? text;
+// in turn, like a marquee: the slogan, then 蛮蛮, then the twins; each clip plays to its end,
+// and each turn then holds 3 s (on the clip's last frame) before the next. A clip that cannot
+// play moves on after 15 s. Played for everyone, reduced motion too (聪哥's choice)
+{
+  const fig = document.getElementById?.("mascot");
+  if (fig?.querySelectorAll) {
+    const slogan = fig.querySelector(".mascot-slogan");
+    const turns = [slogan, ...fig.querySelectorAll("video[data-mascot]")];
+    let at = -1, timer = 0;
+    const next = () => {
+      clearTimeout(timer);
+      at = (at + 1) % turns.length;
+      for (const t of turns) if (t !== turns[at]) { t.hidden = true; t.pause?.(); }
+      const t = turns[at];
+      t.hidden = false;
+      if (t === slogan) { timer = setTimeout(next, 3000); return; }
+      t.currentTime = 0;
+      t.play()?.catch(() => {});
+      timer = setTimeout(next, 15000);
+    };
+    // its last frame stays for 3 s
+    for (const v of turns.slice(1)) v.addEventListener("ended", () => { clearTimeout(timer); timer = setTimeout(next, 3000); });
+    next();
+  }
+}
+const logEl = $("log");
+// The Log follows new lines while Auto-scroll is ticked, as it is at first. Unticking it, scrolling
+// up or selecting text unticks it and stops that; the lines go on arriving below, and ticking it
+// goes back to the end. Unticked by hand it stays so; unticked by a scroll, it also comes back by
+// scrolling to the end. A line is appended as a
+// node of its own, because rewriting the text would lose what is selected. The <pre> takes focus
+// on a click, or the keys go to the page: Ctrl + A would select all of it.
+const logView = { following: true, held: false, unseen: 0, last: false };
+const logSelected = () => { const s = getSelection(); return !s.isCollapsed && logEl.contains(s.anchorNode); };
+function showLogView() {
+  $("logFollow").checked = logView.following;
+  $("logNew").textContent = logView.unseen ? t("log.new", `New lines: ${logView.unseen}`, { n: logView.unseen }) : "";
+  $("logLastTab").textContent = logView.last ? t("log.now", "This page") : t("log.last", "Last session");
+  $("logFollow").parentElement.hidden = $("logNew").hidden = logView.last;
+}
+// The last session's log has a tab of its own, inside the closed Log panel and with nothing to
+// announce it: a session you ended yourself may still be the one that went wrong (the page can't
+// tell a Disconnect from giving up on a frozen picture), and most of the time nobody needs it.
+function showLastLog(on) {
+  logView.last = on; logEl.hidden = on; $("logLast").hidden = !on; showLogView();
+  if (on) $("logLast").scrollTop = 0; else if (logView.following) logEl.scrollTop = logEl.scrollHeight;
+}
+function stopLog(held) {
+  logView.held ||= held; logView.following = false; showLogView();
+}
+function followLog() {
+  if (logSelected()) getSelection().removeAllRanges();
+  logView.held = false; logView.following = true; logView.unseen = 0;
+  logEl.scrollTop = logEl.scrollHeight; showLogView();
+}
+function logLine(s) {
+  logEl.append(s + "\n");
+  if (logView.following) logEl.scrollTop = logEl.scrollHeight;
+  else { logView.unseen++; showLogView(); }
+}
+logEl.addEventListener("scroll", () => {
+  if (!logEl.clientHeight) return;   // the panel is closed
+  const atEnd = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 4;
+  if (!atEnd) { if (logView.following) stopLog(false); }
+  else if (!logView.following && !logView.held && !logSelected()) followLog();
+});
+document.addEventListener("selectionchange", () => { if (logView.following && logSelected()) stopLog(false); });
+for (const pre of [logEl, $("logLast")]) pre.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "a") {
+    e.preventDefault(); getSelection().selectAllChildren(pre);
+  }
+});
+$("logLastTab").onclick = () => showLastLog(!logView.last);
+$("logPanel").addEventListener("toggle", () => { if ($("logPanel").open && logView.following && !logView.last) logEl.scrollTop = logEl.scrollHeight; });
+$("logFollow").onchange = () => {
+  if ($("logFollow").checked) { followLog(); if (document.body.classList.contains("session")) backToCanvas(); }
+  else { stopLog(true); logEl.focus(); }
+};
+$("logCopy").onclick = () => {
+  const said = (text) => { $("logCopy").textContent = text; setTimeout(() => { $("logCopy").textContent = t("log.copy", "Copy all"); }, 1500); };
+  const pre = logView.last ? $("logLast") : logEl;
+  navigator.clipboard.writeText(pre.textContent).then(() => said(t("copied", "Copied")),
+    () => { pre.focus(); getSelection().selectAllChildren(pre); said(t("log.selected", "Selected: copy it now")); });
+};
+showLogView();
+// netBase: the page's byte counts (freerdpNet, which runs for the page's whole life) when this
+// session began, so Info's Network totals are this session's, not every session's since the load
+const info = { started: 0, decoder: "–", transport: "–", server: "–", netBase: { rx: 0, tx: 0 } };
+// Crash capture: the last log lines are kept and, while a session runs, saved to localStorage
+// every few seconds. A clean end (Disconnect, FreeRDP's disconnect hotkey) marks them "clean"; anything else
+// (wasm abort, connection lost, tab crash or reload) leaves "running" or "crashed", and the next
+// start offers the log. Either way the Log's Last session tab holds it. Only the page log is kept: it never contains the password (/p:***), the
+// user (/u:***) or clipboard content.
+const CRASH_KEY = "freerdp-web-lastlog", CRASH_LINES = 300;
+const crash = { lines: [], running: false, userEnded: false, timer: 0, endWatch: 0 };
+// the log lines of a session that ended cleanly (clientStuck(), below)
+const CLEAN_END = /treat this as a user logoff|ERRINFO_LOGOFF_BY_(USER|SERVER)|ERRINFO_RPC_INITIATED_(DISCONNECT|LOGOFF)/;
+// FreeRDP's SDL client's exit codes that say the session itself is over (client/SDL/SDL3/
+// sdl_utils.hpp): the server or the user disconnected or logged it off, a timeout, another
+// connection took it over, the server refused it, licensing. Reconnecting on its own would not
+// bring it back, or would take it from the other connection. The end bar says why; any other
+// code, or a lost connection in the log, is a drop the page retries.
+const SESSION_OVER = { 1: { i18n: "over.server", text: "disconnected by the server" }, 2: { i18n: "over.logoff", text: "logged off" },
+  3: { i18n: "over.idle", text: "idle for too long" }, 4: { i18n: "over.logonTime", text: "the logon took too long" },
+  5: { i18n: "over.other", text: "another connection took it over" }, 6: { i18n: "over.memory", text: "the server ran out of memory" },
+  7: { i18n: "over.refused", text: "the server refused the connection" },
+  8: { i18n: "over.fips", text: "the server refused the connection (FIPS)" }, 9: { i18n: "over.denied", text: "no permission to log on" },
+  10: { i18n: "over.password", text: "the server wants the password again" }, 11: { i18n: "over.disconnected", text: "disconnected" },
+  145: { i18n: "over.cancelled", text: "cancelled" } };
+for (let c = 16; c <= 26; c++) SESSION_OVER[c] = { i18n: "over.licensing", text: "a licensing error on the server" };
+const connLog = [];
+function crashStore(state, reason) {
+  try {
+    localStorage.setItem(CRASH_KEY, JSON.stringify({ state, reason: reason || "", time: Date.now(), lines: crash.lines }));
+  } catch (e) {}
+}
+let sessionPassword = "";
+// ---- Reconnect, without a passkey prompt or a typed password. The session's password stays in
+// this page's memory only, encrypted under a key the page cannot read out (a non-extractable
+// CryptoKey); never in storage. Disconnect, another host, a failed logon or closing the page
+// drop it. Needs a modular client (above): an older one reloads, and Connect asks as usual.
+const again = (() => {
+  let kept = null;   // { hostId, key, iv, box }
+  return {
+    keep(hostId, password) {
+      kept = null;
+      const bytes = new TextEncoder().encode(password), iv = crypto.getRandomValues(new Uint8Array(12));
+      crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"])
+        .then(async (key) => { const box = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, bytes); kept = { hostId, key, iv, box }; })
+        .catch((e) => log("[page] reconnect password not kept: " + e.message)).finally(() => bytes.fill(0));
+    },
+    has(hostId) { return !!kept && kept.hostId === hostId; },
+    async take(hostId) {
+      if (!this.has(hostId)) return null;
+      const bytes = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: kept.iv }, kept.key, kept.box));
+      try { return new TextDecoder().decode(bytes); } finally { bytes.fill(0); }
+    },
+    forget() { kept = null; },
+  };
+})();
+const log = (s) => {
+  s = String(s);
+  if (sessionPassword) s = s.split(sessionPassword).join("***");
+  s = s.replace(/([/+-](?:p|gp|password):)(?:"[^"\n]*"|'[^'\n]*'|[^\s]*)/gi, "$1***");
+  crash.lines.push(s); if (crash.lines.length > CRASH_LINES) crash.lines.shift();
+  // FreeRDP's disconnect hotkey: the same as the toolbar's Disconnect, at once (the mouse and the
+  // keys come back too): the client does not exit after it in a browser, see below
+  if (/pressed, disconnecting RDP session/.test(s)) { endCapture(); disconnect(); }
+  else if (CLEAN_END.test(s) && crash.running && !crash.endWatch) crash.endWatch = setTimeout(clientStuck, 5000);
+  logLine(s); console.log(s);
+  const m = /AV1 decoder: ([^,\n]+)/.exec(s);
+  if (m) info.decoder = m[1].trim();
+  if (/WebCodecs AV1 decode failed|using dav1d/.test(s)) info.decoder = "dav1d (fallback)";
+  if (/The connection failed|ERRCONNECT_|tcp-shim\]/.test(s)) { $("logPanel").open = true; saveOffer.failed = true; }
+  // the client is past the connection sequence (and, with NLA, the password was accepted)
+  if (!saveOffer.due && /\[gdi_init_ex\]: Remote framebuffer format/.test(s)) { saveOffer.due = true; setTimeout(offerSave, 2000); }
+  // this connection's own log, for how it ended (crash.lines spans reconnections)
+  connLog.push(s); if (connLog.length > CRASH_LINES) connLog.shift();
+  if (/\[gdi_init_ex\]: Remote framebuffer format|client_auto_reconnect.*(succeeded|success)/i.test(s)) reconnected();
+  // FreeRDP's own reconnect is silent: say so, or the last picture looks like a session that hung
+  if (/\[client_auto_reconnect_ex\]: Network disconnect/.test(s)) droppedNow();
+};
+// "Save the password?" after connecting with a typed one (hosts-ui.js keeps it until answered)
+const saveOffer = { due: false, failed: false, timer: 0 };
+function offerSave() {
+  const o = !saveOffer.failed && crash.running && HostsUI.saveOffer();
+  if (!o) return;
+  $("saveText").textContent = (o.update ? t("save.update", `Update the saved password of “${o.name}”?`, { name: o.name })
+    : t("save.ask", `Save the password of “${o.name}”?`, { name: o.name })) +
+    t("save.next", " Next time your passkey unlocks it (Touch ID, Windows Hello…).") + (document.pointerLockElement ? t("save.mouse", " Ctrl + Alt frees the mouse.") : "");
+  for (const id of ["saveYes", "saveLater", "saveNever"]) $(id).disabled = false;
+  $("saveYes").textContent = o.update ? t("save.yesUpdate", "Update with passkey") : t("save.yes", "Save with passkey");
+  $("saveBar").hidden = false;
+  clearTimeout(saveOffer.timer); saveOffer.timer = setTimeout(() => answerSave(false), 30000);
+}
+function closeSaveBar(after = 0) {
+  clearTimeout(saveOffer.timer);
+  saveOffer.timer = setTimeout(() => { $("saveBar").hidden = true; }, after);
+}
+function answerSave(never) { HostsUI.declineSave(never); closeSaveBar(); $("canvas").focus(); }
+$("saveLater").onclick = () => answerSave(false);
+$("saveNever").onclick = () => answerSave(true);
+$("saveYes").onclick = async () => {
+  clearTimeout(saveOffer.timer);
+  for (const id of ["saveYes", "saveLater", "saveNever"]) $(id).disabled = true;
+  $("saveText").textContent = t("vault.waiting", "Waiting for the passkey…");
+  try { await HostsUI.acceptSave(); $("saveText").textContent = t("save.saved", "Saved in the passkey vault."); closeSaveBar(2500); }
+  catch (e) {
+    $("saveText").textContent = e.name === "AbortError" || e.name === "NotAllowedError" ? t("save.cancelled", "Not saved: the passkey prompt was cancelled.")
+      : t("save.failed", "Not saved: " + e.message, { why: e.message });
+    closeSaveBar(6000);
+  }
+  $("canvas").focus();
+};
+// key and vars: the line in the visitor's language, again when it changes (retext, below)
+let statusLine = ["", ""];
+const status = (s, key = "", vars) => { statusLine = [s, key, vars]; $("status").textContent = key ? t(key, s, vars) : s; };
+
+// ---- the selected host (hosts-ui.js) fills the form; the form's edits go back into it
+const HostsUI = window.FreeRDPHostsUI;
+// the address field holds a gateway (WebSocket) or, with Direct TCP, the RDP server itself:
+// different addresses, kept apart in the host
+function showTarget(h) {
+  const direct = $("direct").checked;
+  showTargetLabel();
+  $("host").placeholder = direct ? "rdp-server:3389" : "127.0.0.1:3390";
+  $("host").value = direct ? h.directHost : h.host;
+}
+function showTargetLabel() { $("hostLabel").textContent = $("direct").checked ? t("hop.rdp", "RDP server") : t("hop.gateway", "Gateway"); }
+function showHost(h) {
+  $("hostName").value = h.name;
+  $("direct").checked = !!window.directSocketsAvailable && h.direct;
+  showTarget(h);
+  $("user").value = h.user;
+  $("pass").value = "";
+  $("extra").value = h.extra;
+  $("fs").checked = h.fullscreen;
+  showSession(h.session);
+  updateRoute();
+}
+// what the form says, into the selected host (passwords never)
+function storeFields() {
+  const direct = $("direct").checked;
+  return HostsUI.update({ name: $("hostName").value.trim() || "Host", [direct ? "directHost" : "host"]: $("host").value.trim(),
+    direct, user: $("user").value, extra: $("extra").value, fullscreen: $("fs").checked, session: readSession() });
+}
+for (const id of ["hostName", "host", "user", "extra"]) $(id).addEventListener("input", storeFields);
+$("fs").addEventListener("change", storeFields);
+HostsUI.onSelect((h, vaultOnly) => { if (vaultOnly) updateSummary(); else { again.forget(); showHost(h); } });
+const uiPrefs = (() => { try { return JSON.parse(localStorage.getItem("freerdp-web-ui") || "{}"); } catch (e) { return {}; } })();
+const saveUiPrefs = () => { try { localStorage.setItem("freerdp-web-ui", JSON.stringify(uiPrefs)); } catch (e) {} };
+function loadSettings() {
+  const q = new URLSearchParams(location.search);
+  // a host's link (?v=<host:port>, its Copy link): that saved host, or a new one for the address
+  if (q.has("v") && !HostsUI.openLink(q.get("v"))) log("[page] ignored the link's address");
+  q.delete("v");
+  showHost(HostsUI.current());
+  // URL overrides, for testing: the form only
+  if (q.get("u")) $("user").value = q.get("u");
+  if (q.has("extra")) {
+    try { $("extra").value = FreeRDPVault.validateOptions(q.get("extra")); }
+    catch (e) { q.delete("extra"); log("[page] ignored credential or secret-export options in the URL"); }
+  }
+  if (q.has("fs")) $("fs").checked = q.get("fs") === "1";
+  updateSessionText(); updateRoute();
+  $("advancedPanel").open = !!uiPrefs.advancedOpen;
+  // Do not accept passwords in URLs: history, referrers and access logs retain them.
+  q.delete("p");
+  if (q.toString() !== new URLSearchParams(location.search).toString())
+    history.replaceState(null, "", location.pathname + (q.size ? "?" + q : "") + location.hash);
+  return q.get("autoconnect") === "1";
+}
+
+// Whether the browser has a hardware decoder for a codec string. WebCodecs never says which
+// decoder it picked; the client asks for "no-preference", which takes hardware when there is
+// one, so this is what decodes (unless the browser falls back on its own, e.g. past its size).
+// The answer comes later: the session settings show it, and Least CPU uses it, once it is in.
+const hwDecoder = {};
+function hardware(codec) {
+  if (!(codec in hwDecoder)) {
+    hwDecoder[codec] = null;
+    if (typeof VideoDecoder === "function")
+      VideoDecoder.isConfigSupported({ codec, hardwareAcceleration: "prefer-hardware" })
+        .then((r) => { hwDecoder[codec] = !!r.supported; }, () => { hwDecoder[codec] = false; })
+        .then(() => { if (document.readyState !== "loading") updateSessionText(); });
+    else hwDecoder[codec] = false;
+  }
+  return hwDecoder[codec];
+}
+const hwText = (h) => h === true ? t("info.hardware", "hardware") : h === false ? t("info.software", "software") : t("info.checking", "checking…");
+// the codec strings the hardware is asked about: AV1 Main (4:2:0) and H.264 High, as Info does
+const HW = { av1: "av01.0.13M.08", h264: "avc1.640028" };
+const codecEnv = () => ({ av1Hardware: hardware(HW.av1) === true });
+
+// ---- Session settings: a few plain choices; options.js turns them into FreeRDP options
+const radio = (name) => document.querySelector(`input[name=${name}]:checked`)?.value;
+const setRadio = (name, value) => { const r = document.querySelector(`input[name=${name}][value="${value}"]`); if (r) r.checked = true; };
+// Video's Custom list, as the host stores it; Least data and Least CPU show their own list
+let codecRows = FreeRDPOptions.normalize({}).codecs;
+function readSession() {
+  return FreeRDPOptions.normalize({ audio: $("optAudio").checked, mic: $("optMic").checked, clipboard: $("optClipboard").checked,
+    codec: radio("codec"), codecs: codecRows, strategy: radio("strategy"), scale: radio("scale"), screens: radio("screens") });
+}
+function showSession(session) {
+  const s = FreeRDPOptions.normalize(session);
+  codecRows = s.codecs;
+  $("optAudio").checked = s.audio; $("optMic").checked = s.mic; $("optClipboard").checked = s.clipboard;
+  setRadio("codec", s.codec); setRadio("strategy", s.strategy); setRadio("scale", s.scale); setRadio("screens", s.screens);
+  setRadio("keys", FreeRDPKeyboard.get());
+  updateSessionText();
+}
+// each with its key in i18n.js; said() gives the text in the visitor's language
+const said = (m) => t(m.i18n, m.text);
+const CODEC_HINTS = {
+  auto: { i18n: "hint.codecAuto", text: "The server picks from every codec the client offers (AV1 4:4:4 included)." },
+  bandwidth: { i18n: "hint.codecBandwidth", text: "Every codec, with full colour: the server takes the newest it has (AV2, then AV1, then H.264). The least data, the most work for both sides." },
+  cpu: { i18n: "hint.codecCpu", text: "What this browser decodes in hardware, one stream with half-resolution colour: H.264, and AV1 first where the graphics card decodes it. No AV2: this page decodes it in software." },
+  custom: { i18n: "hint.codecCustom", text: "Your order: drag a codec, or use its arrows. The server picks from what the client offers, by its own order, so a codec it would take before one you put higher is not offered." },
+};
+// Video's list: a row per codec, in the order of the choice; a change to a preset's list makes it Custom
+const CODEC_NAMES = { av2: "AV2", av1: "AV1", h264: "H.264", progressive: "RemoteFX progressive", rfx: "RemoteFX" };
+function codecNote(id) {
+  if (id === "av2") return t("codec.av2Note", "least data; decoded in software, in this page");
+  if (id === "av1" || id === "h264") {
+    const hw = hwText(hardware(HW[id]));
+    return t("codec.webcodecsNote", `WebCodecs: ${hw} in this browser`, { hw });
+  }
+  return id === "progressive" ? t("codec.progressiveNote", "sharpens in passes; decoded in software") : t("codec.rfxNote", "decoded in software");
+}
+function codecState(r) {
+  if (!r.on) return t("codec.off", "off");
+  if (r.offered) return t("codec.offered", "offered");
+  const before = CODEC_NAMES[r.before];
+  return t("codec.skipped", `not offered: the server would take it before ${before}`, { before });
+}
+let dragged = null;
+function renderCodecs(s) {
+  const box = $("codecList"), list = FreeRDPOptions.listOf(s, codecEnv());
+  box.hidden = !list;
+  if (!list) return;
+  const rows = FreeRDPOptions.offered(list);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const items = rows.map((r, i) => {
+    const v = FreeRDPOptions.VIDEO.find((x) => x.id === r.id), li = el("li", r.offered ? "on" : r.on ? "skipped" : "off");
+    li.draggable = true; li.dataset.id = r.id;
+    li.append(el("span", "grip", "⠿"));
+    const name = el("label", "name"), check = el("input"); check.type = "checkbox"; check.checked = r.on; check.dataset.act = "on";
+    name.append(check, el("b", null, CODEC_NAMES[r.id]));
+    li.append(name);
+    if (v.chroma) {
+      const sel = el("select"); sel.dataset.act = "chroma"; sel.disabled = !r.on;
+      sel.setAttribute("aria-label", t("codec.chroma", "Colour"));
+      for (const [value, text] of [["444", "4:4:4"], ["420", "4:2:0"]]) { const o = el("option", null, text); o.value = value; sel.append(o); }
+      sel.value = r.i444 ? "444" : "420";
+      li.append(sel);
+    }
+    const up = el("button", "arrow", "↑"), down = el("button", "arrow", "↓");
+    up.type = down.type = "button"; up.dataset.act = "up"; down.dataset.act = "down";
+    up.disabled = i === 0; down.disabled = i === rows.length - 1;
+    up.setAttribute("aria-label", t("codec.up", "Earlier")); down.setAttribute("aria-label", t("codec.down", "Later"));
+    li.append(el("small", "state", codecState(r)), el("small", "detail", codecNote(r.id)), up, down);
+    return li;
+  });
+  items.push(el("li", "fixed", t("codec.basics", "Planar, ClearCodec and uncompressed: always there, for what the others leave")));
+  box.replaceChildren(...items);
+}
+// a change to the list: it becomes Custom (from the list on show), stored with the host
+function changeCodecs(change) {
+  const s = readSession();
+  const list = FreeRDPOptions.listOf(s, codecEnv()).map((r) => ({ ...r }));
+  change(list);
+  codecRows = FreeRDPOptions.codecList(list);
+  setRadio("codec", "custom");
+  HostsUI.update({ session: readSession() });
+  updateSessionText();
+}
+$("codecList").addEventListener("change", (e) => {
+  const id = e.target.closest("li")?.dataset.id, act = e.target.dataset.act;
+  if (!id || !act) return;
+  changeCodecs((list) => { const r = list.find((x) => x.id === id); if (act === "on") r.on = e.target.checked; else r.i444 = e.target.value === "444"; });
+});
+$("codecList").addEventListener("click", (e) => {
+  const act = e.target.dataset?.act, id = e.target.closest("li")?.dataset.id;
+  if ((act !== "up" && act !== "down") || !id) return;
+  changeCodecs((list) => { const i = list.findIndex((x) => x.id === id), j = act === "up" ? i - 1 : i + 1;
+    if (j >= 0 && j < list.length) [list[i], list[j]] = [list[j], list[i]]; });
+  $("codecList").querySelector(`li[data-id="${id}"] [data-act=${act}]:not(:disabled)`)?.focus();
+});
+// drag and drop (a mouse or a pen; on touch screens, the arrows)
+$("codecList").addEventListener("dragstart", (e) => { dragged = e.target.closest("li[data-id]")?.dataset.id ?? null; e.dataTransfer.effectAllowed = "move"; });
+$("codecList").addEventListener("dragover", (e) => { if (dragged && e.target.closest("li[data-id]")) e.preventDefault(); });
+$("codecList").addEventListener("drop", (e) => {
+  const to = e.target.closest("li[data-id]")?.dataset.id, from = dragged;
+  dragged = null;
+  if (!from || !to || from === to) return;
+  e.preventDefault();
+  // dropped on a row: it takes that row's place, so moved down it goes after it, moved up before it
+  changeCodecs((list) => {
+    const at = (id) => list.findIndex((x) => x.id === id), down = at(from) < at(to), [r] = list.splice(at(from), 1);
+    list.splice(at(to) + (down ? 1 : 0), 0, r);
+  });
+});
+$("codecList").addEventListener("dragend", () => { dragged = null; });
+const STRATEGY_HINTS = {
+  recommended: { i18n: "hint.strategyRecommended", text: "The client and the server choose." },
+  bandwidth: { i18n: "hint.strategyBandwidth", text: "For slow links: the server sends less (no wallpaper or animations) and compresses more, which costs it more CPU." },
+  server: { i18n: "hint.strategyServer", text: "For a busy server: it compresses less and sends more data instead." },
+};
+// with the toolbar's All screens, on a computer with more than one screen
+const SCREENS_HINTS = {
+  separate: { i18n: "hint.screensSeparate", text: "Each screen is a monitor of its own for the remote desktop, as on physical screens: a window maximizes on one, and you drag it to the next." },
+  span: { i18n: "hint.screensSpan", text: "One desktop as wide as all the screens: a maximized window covers every one of them." },
+};
+const KIND_NAMES = { video: { i18n: "set.video", text: "Video" }, audio: { i18n: "set.sound", text: "Sound" }, mic: { i18n: "set.mic", text: "Microphone" },
+  clipboard: { i18n: "set.clipboard", text: "Clipboard" }, network: { i18n: "set.priority", text: "Priority" },
+  compression: { i18n: "set.priority", text: "Priority" }, scale: { i18n: "set.scale", text: "Remote scale" } };
+// what Automatic sends: the screen's scale, above 100 % (vault.js connectionArgs)
+function scaleHint(scale) {
+  const screen = Math.min(500, Math.round((window.devicePixelRatio || 1) * 100));
+  return (scale === "auto" ? t("hint.scaleAuto", `Automatic: your screen's scale, now ${screen} %. `, { screen })
+    : t("hint.scaleFixed", `Always ${scale} %, also after a resize or full screen. `, { scale })) +
+    t("hint.scaleWho", "Windows follows it; GNOME from gnome-remote-desktop 50 on (older versions keep their own setting).");
+}
+function updateSessionText() {
+  const s = readSession(), extra = $("extra").value;
+  $("codecHint").textContent = said(CODEC_HINTS[s.codec]);
+  renderCodecs(s);
+  $("strategyHint").textContent = said(STRATEGY_HINTS[s.strategy]);
+  $("scaleHint").textContent = scaleHint(s.scale);
+  $("screensHint").textContent = said(SCREENS_HINTS[s.screens]);
+  // Extra options of the same kind win: say which settings they override
+  const over = [...new Set(FreeRDPOptions.overridden(extra).map((k) => said(KIND_NAMES[k])))];
+  const changed = !FreeRDPOptions.isDefault(s);
+  const list = (items) => items.join(t("list.sep", ", "));
+  $("customNote").hidden = !over.length && !changed;
+  $("customText").textContent = over.length ? t("set.overridden", `Extra options set ${over.join(", ")}: they win over the choice here. `, { kinds: list(over) })
+    : t("set.changed", "Changed from the recommended settings. ");
+  const label = (name, value) => document.querySelector(`input[name=${name}][value="${value}"]`).parentElement.textContent.trim();
+  $("sessionSummary").textContent = over.length ? t("set.custom", "custom") : !changed ? t("set.recommendedSummary", "recommended") :
+    list([s.codec !== "auto" && label("codec", s.codec), s.strategy !== "recommended" && label("strategy", s.strategy),
+     s.scale !== "auto" && t("set.scaleSummary", "scale " + label("scale", s.scale), { scale: label("scale", s.scale) }),
+     s.screens !== "separate" && label("screens", s.screens),
+     !s.audio && t("set.noSound", "no sound"), s.mic && t("set.micSummary", "microphone"), !s.clipboard && t("set.noClipboard", "no clipboard")].filter(Boolean));
+  $("preview").textContent = FreeRDPOptions.resolve(s, extra, codecEnv()).join(" ");
+  updateSummary();
+}
+// the advanced choices in effect, shown under Connect even while Advanced is closed
+function updateSummary() {
+  const parts = [];
+  if ($("direct").checked) parts.push(t("summary.direct", "Direct TCP (installed app), no gateway"));
+  const h = HostsUI.current();
+  if (h.vault) parts.push(h.vaultSaved ? t("summary.vaultSaved", "Password from the passkey vault") : t("summary.vaultOn", "Passkey vault on, no password saved yet"));
+  if ($("extra").value.trim()) parts.push(t("summary.extra", "Extra options: " + $("extra").value.trim(), { extra: $("extra").value.trim() }));
+  $("summary").textContent = parts.join(" · ");
+}
+document.querySelectorAll("#sessionPanel input").forEach((el) => el.addEventListener("change", () => {
+  if (el.closest("#codecList")) return;   // its own handlers
+  if (el.name === "keys") FreeRDPKeyboard.set(el.value);
+  else if (el.id !== "fs") HostsUI.update({ session: readSession() });
+  updateSessionText();
+}));
+$("restoreDefaults").onclick = () => {
+  HostsUI.update({ session: { ...FreeRDPOptions.DEFAULTS } });
+  showSession(FreeRDPOptions.DEFAULTS);
+  if (FreeRDPOptions.overridden($("extra").value).length) $("advancedPanel").open = true;   // what still overrides
+};
+$("extra").addEventListener("input", updateSessionText);
+$("extra").addEventListener("change", updateSessionText);
+$("advancedPanel").addEventListener("toggle", () => { uiPrefs.advancedOpen = $("advancedPanel").open; saveUiPrefs(); });
+window.addEventListener("storage", (e) => {
+  if (e.key === FreeRDPKeyboard.KEY) setRadio("keys", FreeRDPKeyboard.get());
+  if (e.key === FreeRDPKeyboard.HOTKEYS_KEY || e.key === null) showHotkeys();
+});
+// FreeRDP's hotkeys as chosen on the Keyboard page, where people look for them: under the
+// Shortcuts choice, on the toolbar's buttons, and once in the session after they change
+function showHotkeys() {
+  const h = FreeRDPKeyboard.getHotkeys(), text = (a) => FreeRDPKeyboard.hotkeyText(h, a);
+  $("hotkeyHint").textContent = FreeRDPKeyboard.MODIFIERS[h.modifier].codes
+    ? t("hint.hotkeys", `FreeRDP's hotkeys: ${text("fullscreen")} full screen, ${text("disconnect")} disconnect, ${text("grab")} keyboard grab.`,
+      { fullscreen: text("fullscreen"), disconnect: text("disconnect"), grab: text("grab") })
+    : t("hint.hotkeysOff", "FreeRDP's hotkeys are off; full screen and Disconnect are on the toolbar.");
+  $("tbFs").title = FreeRDPKeyboard.MODIFIERS[h.modifier].codes ? text("fullscreen") : "";
+  $("tbQuit").title = FreeRDPKeyboard.MODIFIERS[h.modifier].codes ? text("disconnect") : "";
+}
+showHotkeys();
+
+// ---- the one-line SSH command of the safety notice: the local end follows the gateway's
+// port; on the server, websockify stays on 3390, next to RDP on 3389. user@server is fixed
+// text, never the User field: the notice is what a screen share or a recording shows first
+function updateRoute() {
+  const m = /^(?:127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})$/.exec($("host").value.trim());
+  const port = m ? m[1] : "3390";
+  $("hopGateway").textContent = $("direct").checked ? t("hop.none", "none (direct TCP)") : $("host").value.trim() || "127.0.0.1:3390";
+  $("sshCmd").textContent = `ssh -tt -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -L 127.0.0.1:${port}:127.0.0.1:3390 user@server websockify 127.0.0.1:3390 127.0.0.1:3389`;
+}
+$("host").addEventListener("input", updateRoute);
+$("copyCmd").onclick = () => navigator.clipboard.writeText($("sshCmd").textContent).then(
+  () => { $("copyCmd").textContent = t("copied", "Copied"); setTimeout(() => { $("copyCmd").textContent = t("copy", "Copy"); }, 1500); },
+  () => { getSelection().selectAllChildren($("sshCmd")); $("copyCmd").textContent = t("copyPress", "Press Ctrl+C"); });
+
+// ---- Advanced: direct TCP and the passkey vault
+function showDirectHint() {
+  if (window.directSocketsAvailable) $("directHint").textContent = t("adv.directHint", "This installed app can open TCP itself: enter the RDP server, usually host:3389.");
+  else {
+    // DOM calls, not innerHTML: the installed app enforces Trusted Types and would refuse a string
+    const how = Object.assign(document.createElement("a"), { href: "install.html", textContent: t("adv.directHow", "How to install it") });
+    $("directHint").replaceChildren(t("adv.directOnly", "Only in the installed app (Isolated Web App). "), how, t("punct.period", "."));
+  }
+}
+if (!window.directSocketsAvailable) $("direct").disabled = true;
+showDirectHint();
+$("direct").addEventListener("change", () => {
+  storeFields(); showTarget(HostsUI.current());
+  updateRoute(); updateSummary();
+});
+
+let autoconnect = loadSettings();
+updateRoute();
+$("canvas").addEventListener("contextmenu", (e) => e.preventDefault());
+$("canvas").addEventListener("mousedown", () => $("canvas").focus());
+let runtimeReady = false, runtimeFailed = false, connectStarted = false;
+let resolveRuntime;
+let runtime = new Promise(resolve => { resolveRuntime = resolve; });
+const HOTKEY_DIR = "/config";
+// One client per connection. A client linked with -sMODULARIZE defines createFreeRDP(): each call
+// is a new runtime (its own memory, threads and C globals), so Reconnect starts a fresh client in
+// this page. An older client runs once, from the global Module below; the next connection reloads.
+const modularClient = () => typeof window.createFreeRDP === "function";
+function moduleConfig() {
+  const m = {
+  canvas: $("canvas"),
+  // the client's sockets: ws:// or wss:// (Connect sets url, gatewayRoute). Emscripten's socket layer
+  // takes this object when it starts, so it has to exist before that
+  websocket: {},
+  // SDL listens for keys on the whole window and calls preventDefault(), which blocks typing in
+  // the page's own input boxes. SDL reads hints from the environment: limit it to the canvas.
+  // FreeRDP reads its hotkeys from $XDG_CONFIG_HOME/freerdp/sdl-freerdp.json; the C runtime
+  // copies ENV into environ before main(), so this has to be set here (the file comes at connect)
+  // SDL_MOUSE_EMULATE_WARP_WITH_RELATIVE=0: SDL must not turn a move of a hidden mouse into its
+  // relative mode, which locks the pointer (Capture, below, says why)
+  preRun: [() => { m.ENV.SDL_EMSCRIPTEN_KEYBOARD_ELEMENT = "#canvas"; m.ENV.XDG_CONFIG_HOME = HOTKEY_DIR; m.ENV.SDL_MOUSE_EMULATE_WARP_WITH_RELATIVE = "0"; }],
+  print: (t) => log(t),
+  printErr: (t) => log(t),
+  // the server's clipboard, from the client's clipboard bridge (below)
+  freerdpClipboardWrite: (text) => clipboardWrite(text),
+  freerdpClipboardWriteImage: (bytes, isPng) => clipboardWriteImage(bytes, isPng),
+  // the files of a copy: the list, what the server asks of ours, what it answers of its (below)
+  freerdpClipboardFiles: (list) => filesFromSession(list),
+  freerdpClipboardFileRequest: (...request) => filesAnswer(...request),
+  freerdpClipboardFileData: (stream, ok, bytes) => filesData(stream, ok, bytes),
+  // with All screens, the screens the canvas is split into (Separate screens; "All screens", below)
+  freerdpMonitors: () => screensMonitors(),
+  onRuntimeInitialized() {
+    runtimeReady = true; resolveRuntime(true);
+    $("go").disabled = false; goReady = true; showGo(); status("ready", "status.ready"); window.freerdpPageReady = true;
+    // a client built with the Web Audio microphone backend (FreeRDP's audin "emscripten")
+    if (typeof Module._audin_emscripten_release === "function") {
+      $("optMic").disabled = false; $("micNote").hidden = true; micReady = true; showMicTitle();
+    }
+    if (autoconnect) { autoconnect = false; connect(); }   // the first client only
+  },
+  onExit(code) {
+    if (crash.abandoned === m) { log("[page] the client the page had ended exited now: " + code); return; }
+    status("exited: " + code, "status.exited", { code }); log("[page] exit code " + code); window.__freerdpExit = code;
+    conn.refused = refusedBeforePicture();   // read here: the next client brings its own counters
+    const over = SESSION_OVER[code];   // the session itself ended: no reconnecting on its own
+    if (code !== 0 && !over && !conn.refused) $("logPanel").open = true;   // show the reason
+    // exit code 0 also follows a lost connection: look at the log, not only at the code
+    const lost = !over && connLog.some((l) => /ERRCONNECT_|Network disconnect|\[tcp-shim\].*(Error|abort)/i.test(l));
+    crashEnd(!crash.userEnded && !over && !conn.refused && (code !== 0 || lost), over ? "" : code !== 0 ? "exit code " + code : lost ? "connection lost" : "");
+    setTimeout(() => sessionEnded(!over && (lost || code !== 0), over), 0);   // after this client's exit is done
+  },
+  onAbort(what) { runtimeFailed = true; resolveRuntime(false); HostsUI.lock(); log("[page] aborted: " + what); crashEnd(true, "wasm abort: " + what);
+    // a client that never got ready: say so, or the button says "Loading…" for good (#368)
+    // (not isolated on a first visit: once coi-serviceworker's reload has had its chance, tt-policy.js)
+    if (!goReady) (window.freerdpAfterReloadChance ?? ((f) => f()))(() => {
+      if (goReady) return;
+      $("go").disabled = true; $("go").textContent = t("form.failed", "Could not start");
+      const notIsolated = window.freerdpNotIsolated?.();   // tt-policy.js says why
+      if (notIsolated) {
+        log("[page] this page is not cross-origin isolated (crossOriginIsolated false): the client's threads cannot start");
+        status(notIsolated, "status.notIsolated");
+      } else status("the client did not start: " + what, "status.noStart", { what });
+    }); },
+  };
+  return m;
+}
+var Module = moduleConfig();   // an older client's script reads this global as it loads
+// a modular client: a new runtime, ready for the next connection (the first one at page load)
+function newClient() {
+  runtimeReady = false; runtimeFailed = false;
+  runtime = new Promise(resolve => { resolveRuntime = resolve; });
+  const config = Module = moduleConfig();
+  window.createFreeRDP(config).then((m) => { if (m && m !== config && Module === config) Module = m; },
+    (e) => config.onAbort(e?.message || e));
+}
+// engine.js loads the client (the build this browser runs best) once the page's scripts have run
+document.addEventListener("DOMContentLoaded", () => (window.freerdpClient ?? Promise.resolve()).then(
+  () => { if (modularClient()) newClient(); },
+  (e) => { log("[page] " + e.message); status("the client did not load", "status.noClient"); }));
+function crashEnd(unexpected, reason) {
+  clearInterval(crash.timer); clearTimeout(crash.endWatch); crash.endWatch = 0; crash.running = false;
+  crashStore(unexpected ? "crashed" : "clean", reason);
+}
+// A session that ended cleanly (a logoff, or the server ending it) should end the client: in a
+// browser it often does not. FreeRDP closes its window (the canvas goes 0 x 0) and then the
+// runtime never exits (one of its threads stays, it seems), so onExit never comes, the end bar
+// never shows and Reconnect, which waits for that exit, did nothing. 5 s after such an end the
+// page ends the session itself; Reconnect then starts a new client, as after an exit.
+function clientStuck() {
+  crash.endWatch = 0;
+  if (!crash.running) return;
+  log("[page] the session ended, the client did not exit: the page ends it");
+  crash.abandoned = Module;   // should it exit after all, its onExit changes nothing
+  crashEnd(false, "");
+  sessionEnded(false);
+}
+window.addEventListener("error", (e) => { if (crash.running) log("[page] error: " + (e.message || e.error)); });
+window.addEventListener("unhandledrejection", (e) => { if (crash.running) log("[page] unhandled rejection: " + (e.reason?.message || e.reason)); });
+// a tab closed or reloaded during a session (also what a renderer crash looks like next time)
+window.addEventListener("pagehide", () => { if (crash.running) crashStore(crash.userEnded ? "clean" : "running"); });
+
+// Full screen is requested from a user gesture (Connect click or FreeRDP's full screen hotkey).
+// The canvas is sized by CSS, so SDL follows it and /dynamic-resolution resizes the remote
+// desktop. Keyboard Lock sends Esc / Windows keys to the remote side (hold Esc to leave).
+// iPhone's Safari has no full screen for the page (document.exitFullscreen and requestFullscreen
+// are undefined there): binding it threw while app.js loaded, so nothing after this line ran and
+// the page said "Loading…" for good (#368). Without it full screen is refused (enterFullscreen)
+// and leaving it does nothing; an older Safari has it as webkitExitFullscreen.
+const nativeExitFullscreen = document.exitFullscreen ?? document.webkitExitFullscreen;
+const realExitFullscreen = () => (nativeExitFullscreen ? nativeExitFullscreen.call(document) : Promise.resolve());
+// SDL3 also requests full screen on its canvas when it (re)creates its window, e.g. after the
+// GRD handover redirect; Emscripten defers such a request to the next click or key press, so the
+// page appeared to go full screen by itself. The page owns full screen: ignore canvas requests.
+for (const name of ["requestFullscreen", "webkitRequestFullscreen"]) {
+  if (HTMLCanvasElement.prototype[name] || Element.prototype[name])
+    HTMLCanvasElement.prototype[name] = function () { return Promise.resolve(); };   // the page did it already
+}
+async function enterFullscreen(screen) {   // screen: a ScreenDetailed, for All screens (below)
+  try {
+    if (!document.documentElement.requestFullscreen) throw new Error("this browser has no full screen for pages");
+    await document.documentElement.requestFullscreen({ navigationUI: "hide", ...(screen && { screen }) });
+  } catch (e) {
+    log("[page] full screen refused: " + e.message);
+    return false;
+  }
+  document.body.classList.add("fs");
+  await lockKeyboard();
+  $("canvas").focus();
+  return true;
+}
+// Keyboard Lock (full screen only) sends Esc, Alt + Tab and the Windows key to the remote side
+let kbLocked = false;
+async function lockKeyboard() {
+  if (!document.fullscreenElement || !navigator.keyboard?.lock) return;
+  try { const was = kbLocked; await navigator.keyboard.lock(); kbLocked = true; syncCaptured(); if (!was) browserNotice(); }
+  catch (e) { log("[page] keyboard lock unavailable: " + e.message); }
+}
+function unlockKeyboard() { navigator.keyboard?.unlock?.(); kbLocked = false; syncCaptured(); }
+// Fill the window: a full screen of the page's own (聪哥, 2026-11-16). The page's full screen is
+// fragile where the remote side needs Esc (Claude Code does, all the time): Firefox and Safari have
+// no Keyboard Lock, so Esc ends their page full screen and never reaches the remote side, and an
+// iPhone has no page full screen at all. In fill mode the page drops its own chrome and the remote
+// desktop takes exactly the browser's visible area (ui.css body.fill), Esc is an ordinary key, and
+// the browser's own full screen (F11, Ctrl + Cmd + F, an installed app, "Add to Home Screen")
+// makes it the whole screen, which nothing in the page can end. Where page full screen comes
+// with Keyboard Lock (Chrome, Edge) the toolbar's Full screen is still that; ?fill=1 and
+// freerdpWeb.setFill choose fill anywhere (brahman, po-brahman-a8: a shell drives the same page).
+const fillByDefault = () => !document.documentElement.requestFullscreen || !navigator.keyboard?.lock;
+let filling = false;
+function setFill(on) {
+  on = !!on;
+  if (on === filling) return filling;
+  if (on && document.fullscreenElement) { unlockKeyboard(); realExitFullscreen(); }
+  filling = on;
+  document.body.classList.toggle("fill", on);
+  document.body.classList.toggle("tbhide", on);
+  showFsButton();
+  log("[page] " + (on ? "fill the window (the browser's own full screen makes it the whole screen)" : "left fill the window"));
+  requestAnimationFrame(() => { placeToolbar(); window.dispatchEvent(new Event("resize")); });
+  window.dispatchEvent(new CustomEvent("freerdpfillchange", { detail: { fill: on } }));
+  if (on && document.body.classList.contains("session")) $("canvas").focus();
+  return filling;
+}
+// for a page or shell that drives this one: freerdpWeb.setFill(true | false), freerdpWeb.fill, and
+// the window event "freerdpfillchange" (detail.fill)
+// (defineProperty, not Object.assign: that would copy the getter's value once, not the getter)
+window.freerdpWeb ??= {};
+window.freerdpWeb.setFill = setFill;
+Object.defineProperty(window.freerdpWeb, "fill", { get: () => filling, configurable: true, enumerable: true });
+// ?fill=1: fill the window from the start (it takes effect once a session shows)
+document.addEventListener("DOMContentLoaded", () => { if (new URLSearchParams(location.search).get("fill") === "1") setFill(true); });
+function toggleFullscreen() {
+  if (filling) { setFill(false); return; }
+  if (document.fullscreenElement) { unlockKeyboard(); releasePointer(); realExitFullscreen(); }
+  else if (fillByDefault()) setFill(true);
+  else enterFullscreen();
+}
+// The page's full screen is not SDL's: SDL 3.2 marks its window full screen on this event and
+// from then on ignores resizes, so when the window grows after the event (macOS animates into
+// full screen) the remote desktop keeps the old size. Stop the event at the window, before
+// SDL's listener on the document; the page handles it here (onFullscreenChange, below).
+for (const type of ["fullscreenchange", "webkitfullscreenchange"])
+  window.addEventListener(type, (e) => { e.stopImmediatePropagation(); if (type === "fullscreenchange") onFullscreenChange(); }, true);
+// A window that changes size in steps (macOS animates into and out of full screen over ~0.8 s,
+// a dragged window edge) would give the server a new monitor layout every half second, FreeRDP's
+// own pace: some servers rebuild the whole session for each one (FreeRDP's shadow server
+// reactivates the client), and a burst of those broke sessions (2026-11-10). While a session
+// runs, the client hears of a resize only once the size has kept still for RESIZE_SETTLE_MS, or
+// RESIZE_MAX_MS after the first one of a burst. The page's own listeners still run at once. This
+// listener is registered before SDL's (the client starts later), and captures, so it runs first.
+const RESIZE_SETTLE_MS = 300, RESIZE_MAX_MS = 1500;
+const settle = { timer: 0, first: 0, passing: false };
+window.addEventListener("resize", (e) => {
+  if (settle.passing || !document.body.classList.contains("session")) return;   // its own, or no session
+  e.stopImmediatePropagation();
+  placeToolbar(); syncHeader();   // the page's own, at once
+  const now = performance.now();
+  if (!settle.timer) settle.first = now;
+  clearTimeout(settle.timer);
+  settle.timer = setTimeout(() => {
+    settle.timer = 0; settle.passing = true;
+    try { window.dispatchEvent(new Event("resize")); } finally { settle.passing = false; }
+  }, now - settle.first >= RESIZE_MAX_MS ? 0 : RESIZE_SETTLE_MS);
+}, true);
+function onFullscreenChange() {
+  if (!document.fullscreenElement) {
+    document.body.classList.remove("fs"); kbLocked = false; syncCaptured(); log("[page] left full screen");
+    if (multiOn() && !screensSpec) screensOff();   // the canvas spans the screens from this one's full screen
+  } else browserNotice();
+  showFsButton();
+  document.body.classList.toggle("tbhide", !!document.fullscreenElement);
+  // The browser fires "resize" before or after "fullscreenchange" (macOS: after), so measure
+  // again once the new layout is in place; SDL's handler reads the current sizes, not the event.
+  requestAnimationFrame(() => { placeToolbar(); window.dispatchEvent(new Event("resize")); });
+}
+// Ctrl + Alt releases a capture (below): both down, nothing else pressed meanwhile. Registered
+// before the other key listeners, which stop some keys (Ctrl + Alt + End), so it sees every key.
+const chordKey = (code) => code === "ControlLeft" || code === "ControlRight" || code === "AltLeft";
+window.addEventListener("keydown", (e) => {
+  if (synthetic || e.repeat) return;
+  if (!chordKey(e.code)) cap.chordOther = true;
+  cap.held.add(e.code);
+}, true);
+window.addEventListener("keyup", (e) => {
+  if (synthetic) return;
+  const ctrl = cap.held.has("ControlLeft") || cap.held.has("ControlRight"), alt = cap.held.has("AltLeft");
+  if (chordKey(e.code) && ctrl && alt && !cap.chordOther && !cap.chordFired && keysCaptured()) {
+    cap.chordFired = true; release();
+  }
+  cap.held.delete(e.code);
+  if (!cap.held.size) { cap.chordOther = false; cap.chordFired = false; }
+}, true);
+window.addEventListener("blur", () => { cap.held.clear(); cap.chordOther = cap.chordFired = false; }, true);
+// FreeRDP's own hotkeys stay active (by default Right Alt + Right Shift + Enter full screen,
+// + D disconnect, + G grab; keyboard.js). Browsers only allow full screen *during* a key or click
+// event, but FreeRDP handles the hotkey later in its main loop, so Emscripten would defer SDL's
+// request to the user's next input. The page therefore performs the browser part of FreeRDP's
+// full screen hotkey in the key event itself, without swallowing the key (SDL still sees it);
+// SDL's late request is then ignored. The session keeps the hotkeys it started with.
+let sessionHotkeys = FreeRDPKeyboard.getHotkeys();
+const hotkeyHeld = new Set();
+window.addEventListener("keyup", (e) => { hotkeyHeld.delete(e.code); }, true);
+window.addEventListener("blur", () => { hotkeyHeld.clear(); }, true);
+window.addEventListener("keydown", (e) => {
+  hotkeyHeld.add(e.code);
+  if (!e.repeat && document.body.classList.contains("session") &&
+      FreeRDPKeyboard.hotkey(sessionHotkeys, e, hotkeyHeld) === "fullscreen") toggleFullscreen();
+}, true);
+// the client's sdl-freerdp.json, in the runtime's in-memory file system (MEMFS), before main()
+function writeHotkeys() {
+  sessionHotkeys = FreeRDPKeyboard.getHotkeys();
+  showHotkeys();   // the hint may predate a change made in this tab (no storage event for that)
+  const prefs = FreeRDPKeyboard.sdlPrefs(sessionHotkeys);
+  Module.FS.mkdirTree(HOTKEY_DIR + "/freerdp");
+  Module.FS.writeFile(HOTKEY_DIR + "/freerdp/sdl-freerdp.json", JSON.stringify(prefs));
+  log("[page] hotkeys: " + JSON.stringify(prefs));
+  // once per choice: the hotkeys of this session, in case they are not the ones the hands know
+  const seen = JSON.stringify(sessionHotkeys);
+  let told = null; try { told = localStorage.getItem("freerdp-web-hotkeys-told"); } catch (e) { /* not stored: told every time */ }
+  if (told === seen) return;
+  try { localStorage.setItem("freerdp-web-hotkeys-told", seen); } catch (e) { /* ignored */ }
+  $("hotkeyToast").textContent = $("hotkeyHint").textContent + t("hint.hotkeysChange", " Change them on the Keyboard page.");
+  $("hotkeyToast").hidden = false;
+  setTimeout(() => { $("hotkeyToast").hidden = true; }, 8000);
+}
+// The mstsc shortcut profile (keyboard.js), on top of FreeRDP's hotkeys. Only while the remote
+// desktop has focus; the page takes these keys, so the remote side does not see them. The
+// keyup of a taken key is dropped as well.
+const takenKeys = new Set();
+window.addEventListener("keyup", (e) => {
+  if (takenKeys.delete(e.code)) { e.preventDefault(); e.stopImmediatePropagation(); }
+}, true);
+window.addEventListener("keydown", (e) => {
+  if (!document.body.classList.contains("session") || e.target !== $("canvas")) return;
+  const act = FreeRDPKeyboard.action(FreeRDPKeyboard.get(), e);
+  if (!act) return;
+  e.preventDefault(); e.stopImmediatePropagation(); takenKeys.add(e.code);
+  if (act === "fullscreen") toggleFullscreen();
+  else if (act === "toolbar") showToolbar();
+  else if (act === "ctrl-alt-del") {
+    // Ctrl and Alt are already down on the remote side: add Delete. SDL reads the key's code.
+    for (const type of ["keydown", "keyup"])
+      $("canvas").dispatchEvent(new KeyboardEvent(type, { code: "Delete", key: "Delete", ctrlKey: true, altKey: true, bubbles: true }));
+    log("[page] Ctrl + Alt + End: sent Ctrl + Alt + Delete");
+  }
+}, true);
+
+// Cmd (Meta, the remote side's Super / Windows key). macOS keeps Cmd + Tab and Cmd + Space for
+// itself even with Keyboard Lock: the page sees Cmd's keydown and then only a blur. Sent at once,
+// the remote side got Super down, and SDL's release of every key on blur made that a Super tap,
+// which opens GNOME's Activities or the Windows Start menu. So Cmd is held back until a key or a
+// click needs it; tapped alone, it still goes as a tap. macOS also sends no keyup for a key
+// released while Cmd is down (Cmd + C): when Cmd goes up, the keys pressed with it that are still
+// down are released here, or the remote side would keep them pressed and repeat them.
+// SDL reads the key's code, so a KeyboardEvent dispatched on the canvas reaches the remote side.
+const meta = { pending: null, sent: false, withMeta: new Map() };
+let synthetic = false;   // the page's own events to SDL, which its listeners let pass
+function dispatchToSdl(event) {
+  synthetic = true;
+  try { $("canvas").dispatchEvent(event); } finally { synthetic = false; }
+}
+const synthKey = (type, init) => dispatchToSdl(new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init }));
+const isMeta = (code) => code === "MetaLeft" || code === "MetaRight";
+const isModifier = (code) => /^(Shift|Control|Alt|Meta)(Left|Right)$|^CapsLock$|^AltGraph$/.test(code);
+function flushMeta() {
+  if (!meta.pending) return;
+  const { key, code } = meta.pending;
+  meta.pending = null; meta.sent = true;
+  synthKey("keydown", { key, code, metaKey: true, location: code === "MetaRight" ? 2 : 1 });
+}
+function resetMeta() { meta.pending = null; meta.sent = false; meta.withMeta.clear(); }
+window.addEventListener("keydown", (e) => {
+  if (synthetic || e.target !== $("canvas") || !document.body.classList.contains("session")) return;
+  if (isMeta(e.code)) {
+    if (meta.sent) return;   // already on the remote side (a repeat)
+    if (!e.repeat) meta.pending = { key: e.key, code: e.code };
+    e.preventDefault(); e.stopImmediatePropagation();
+  } else if (!isModifier(e.code)) {
+    flushMeta();
+    if (meta.sent) meta.withMeta.set(e.code, e.key);
+  }
+}, true);
+window.addEventListener("keyup", (e) => {
+  if (synthetic) return;
+  if (!isMeta(e.code)) { meta.withMeta.delete(e.code); return; }
+  const toCanvas = e.target === $("canvas") && document.body.classList.contains("session");
+  if (meta.pending && toCanvas) flushMeta();   // tapped alone: down now, the real keyup follows
+  else if (!meta.sent) {                       // a Cmd the remote side never got (back from Cmd + Tab)
+    meta.pending = null;
+    if (toCanvas) { e.preventDefault(); e.stopImmediatePropagation(); }
+    return;
+  }
+  for (const [code, key] of meta.withMeta) synthKey("keyup", { code, key });
+  meta.withMeta.clear(); meta.sent = false;
+}, true);
+window.addEventListener("blur", resetMeta, true);   // SDL releases what the remote side holds
+window.addEventListener("mousedown", (e) => { if (e.target === $("canvas")) flushMeta(); }, true);   // Cmd + click
+window.addEventListener("wheel", (e) => { if (e.target === $("canvas")) flushMeta(); }, true);
+
+// Capture: the mouse is locked to the remote desktop (Pointer Lock) and, in full screen, the
+// keyboard too (Keyboard Lock, above); Ctrl + Alt, pressed and released with nothing else,
+// releases both, as in VMware. Only the toolbar's Capture button captures, in a window and in full
+// screen alike: a click on the remote desktop is just a click there (until 20261114 one in full
+// screen captured, and the mouse could not reach the toolbar or a download until Ctrl + Alt).
+// Only the left Alt counts: Windows reports AltGr as Ctrl + right Alt, and French or German
+// keyboards type @ or € with it.
+//
+// SDL is not told about the lock: it would treat the mouse as relative and the RDP server still
+// wants absolute positions. The page moves its own cursor by the lock's movementX/Y, clamped to
+// the remote desktop, and hands SDL ordinary mouse events at that position; the remote pointer's
+// image (the canvas CSS cursor SDL sets, which the browser hides under the lock) is drawn there.
+const cap = { x: 0, y: 0, hotX: 0, hotY: 0, chordOther: false, chordFired: false, held: new Set(), toast: 0 };
+const ARROW = "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="17" height="25" viewBox="0 0 17 25">' +
+  '<path d="M1 1v20l5-5 3.5 8 3-1.3L9 15h7z" fill="#fff" stroke="#000" stroke-width="1.2" stroke-linejoin="round"/></svg>');
+const pointerLocked = () => document.pointerLockElement === $("canvas");
+// "captured": the mouse is (the grip and the toolbar's mouse reveal step aside); Ctrl + Alt also
+// releases a keyboard that is captured alone, as in full screen before Capture
+const keysCaptured = () => pointerLocked() || (kbLocked && !!document.fullscreenElement);
+function syncCaptured() {
+  document.body.classList.toggle("captured", pointerLocked());
+  $("tbCapture").classList.toggle("on", pointerLocked());
+}
+// SDL locks the pointer by itself too, in its relative mouse mode. SDL turns that on when the
+// app moves a hidden mouse to the window's centre twice within 30 ms ("warp emulation", for games;
+// FreeRDP moves the mouse for each pointer position the server sends). Emscripten defers the
+// lock request to the next click or key press, so the page seemed to capture by itself; and SDL
+// never sees the lock (the page keeps pointerlockchange from it), so it asks again at every press
+// of a mouse button, also after Ctrl + Alt. The hint in preRun (above) keeps SDL out of that mode;
+// and the page owns capture, as it owns full screen: the canvas ignores any request but Capture's.
+const nativePointerLock = HTMLCanvasElement.prototype.requestPointerLock;
+let pageLocks = false, clientAskedLock = false;
+if (nativePointerLock)
+  HTMLCanvasElement.prototype.requestPointerLock = function (...args) {
+    if (pageLocks) return nativePointerLock.apply(this, args);
+    if (!clientAskedLock) { clientAskedLock = true; log("[page] the client asked to capture the mouse: ignored, only the toolbar's Capture captures"); }
+    return Promise.resolve();
+  };
+function capture(x, y) {
+  if (!document.body.classList.contains("session") || pointerLocked()) return;
+  const r = $("canvas").getBoundingClientRect();
+  cap.x = x ?? r.width / 2; cap.y = y ?? r.height / 2;
+  lockKeyboard();
+  pageLocks = true;
+  let asked;
+  try { asked = $("canvas").requestPointerLock(); } finally { pageLocks = false; }
+  asked?.catch?.((e) => log("[page] mouse capture refused: " + e.message));
+}
+function releasePointer() { if (pointerLocked()) document.exitPointerLock(); }
+function release() {
+  releasePointer(); unlockKeyboard(); showToolbar();
+  log("[page] Ctrl + Alt: mouse and keyboard released");
+}
+// the session is over (ended on purpose, by the server, or no tries left): the mouse and the keys
+// come back to this computer by themselves. Not while the page is about to reconnect on its own
+function endCapture() {
+  if (!keysCaptured()) return;
+  // the page's cursor goes at once, not when pointerlockchange comes (later, while FreeRDP keeps
+  // the page busy): it would show beside the browser's own
+  releasePointer(); $("vcursor").hidden = true; unlockKeyboard(); showToolbar();
+  log("[page] the session is over: mouse and keyboard released");
+}
+function drawCursor() {
+  const c = $("vcursor"), r = $("canvas").getBoundingClientRect();
+  c.style.transform = `translate(${r.left + cap.x - cap.hotX}px, ${r.top + cap.y - cap.hotY}px)`;
+}
+// SDL's cursor: url(<png data>) <hot x> <hot y>, auto; or a CSS name ("none" when hidden)
+function readCursor() {
+  const css = $("canvas").style.cursor || "default", c = $("vcursor");
+  const m = /url\((["']?)(.*?)\1\)\s*(\d+)?\s*(\d+)?/.exec(css);
+  if (m) { c.src = m[2]; cap.hotX = +(m[3] || 0); cap.hotY = +(m[4] || 0); }
+  else { c.src = ARROW; cap.hotX = 1; cap.hotY = 1; }
+  c.hidden = !pointerLocked() || (!m && css.trim() === "none");
+  drawCursor();
+}
+new MutationObserver(() => { if (pointerLocked()) readCursor(); }).observe($("canvas"), { attributes: true, attributeFilter: ["style"] });
+for (const type of ["pointerlockchange", "webkitpointerlockchange"])
+  window.addEventListener(type, (e) => {
+    e.stopImmediatePropagation();   // SDL's listener is on the document
+    if (type !== "pointerlockchange") return;
+    readCursor(); syncCaptured();
+    if (pointerLocked()) {
+      // the last pointer position was the toolbar's own Capture button, and under the lock the mouse
+      // reports none (pointermove stops for the edge toolbar): forget it, or hideToolbar kept the
+      // toolbar for good, "near" a pointer that no longer moves (聪哥, 2026-11-17). Ctrl + Alt shows
+      // it again (release, below)
+      pointer = null;
+      if (edgeToolbar()) { clearTimeout(tbTimer); tbTimer = setTimeout(hideToolbar, 600); }
+      log("[page] mouse captured; Ctrl + Alt releases it");
+      clearTimeout(cap.toast); $("captureToast").hidden = false;
+      cap.toast = setTimeout(() => { $("captureToast").hidden = true; }, 3000);
+    } else { $("captureToast").hidden = true; showToolbar(); }
+  }, true);
+window.addEventListener("pointerlockerror", () => log("[page] mouse capture refused by the browser"), true);
+// under the lock: the page's cursor position, then the event as SDL would have seen it there.
+// SDL 3.2 reads the mouse from mouse events, SDL 3.4 from pointer events (pointerType "mouse");
+// each ignores the other kind, so SDL gets both. The browser's own pointer events stay away from
+// SDL: under the lock they carry the frozen position (not cancelled, so the mouse events follow).
+const POINTER_TYPE = { mousemove: "pointermove", mousedown: "pointerdown", mouseup: "pointerup" };
+for (const type of Object.values(POINTER_TYPE))
+  window.addEventListener(type, (e) => { if (!synthetic && pointerLocked()) e.stopImmediatePropagation(); }, true);
+for (const type of Object.keys(POINTER_TYPE))
+  window.addEventListener(type, (e) => {
+    if (synthetic || !pointerLocked()) return;
+    e.stopImmediatePropagation(); e.preventDefault();
+    const r = $("canvas").getBoundingClientRect();
+    if (type === "mousemove") {
+      cap.x = Math.min(Math.max(cap.x + e.movementX, 0), r.width - 1);
+      cap.y = Math.min(Math.max(cap.y + e.movementY, 0), r.height - 1);
+      drawCursor();
+    }
+    const init = { bubbles: true, cancelable: true, clientX: r.left + cap.x, clientY: r.top + cap.y,
+      screenX: r.left + cap.x, screenY: r.top + cap.y, movementX: e.movementX, movementY: e.movementY,
+      button: e.button, buttons: e.buttons, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, metaKey: e.metaKey };
+    dispatchToSdl(new PointerEvent(POINTER_TYPE[type], { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+    dispatchToSdl(new MouseEvent(type, init));
+  }, true);
+$("tbCapture").onclick = () => { if (pointerLocked()) release(); else { capture(); backToCanvas(); } };
+
+// Clipboard (text and images). SDL3 has no browser clipboard driver, so the page bridges it:
+//  - remote -> local: FreeRDP hands over text (freerdpClipboardWrite) and CF_DIB images
+//    (freerdpClipboardWriteImage). A DIB is a BMP file without its 14 byte file header: add the
+//    header, let the browser decode it, re-encode as PNG (the only image type browsers write)
+//    and write text and image of the same copy together as one ClipboardItem. Writing needs
+//    document focus, so a failed write is retried on the next focus.
+//  - local -> remote: on focus and every 1.5 s while focused, read the browser clipboard; if it
+//    changed, offer its text and image (converted to a 32 bit bottom-up CF_DIB) to the server.
+//    What we wrote ourselves is not offered back, so nothing ping-pongs.
+const clip = { lastSig: null, pending: null, out: null, outTimer: 0, warned: false, poll: null };
+async function dibToPng(dib) {
+  const h = new DataView(dib.buffer, dib.byteOffset, dib.byteLength);
+  const biSize = h.getUint32(0, true), bits = h.getUint16(14, true), compression = h.getUint32(16, true);
+  const colors = bits <= 8 ? (h.getUint32(32, true) || 1 << bits) : 0;
+  const masks = compression === 3 && biSize === 40 ? 12 : 0;            // BI_BITFIELDS
+  const file = new Uint8Array(14 + dib.byteLength), v = new DataView(file.buffer);
+  file[0] = 0x42; file[1] = 0x4d; v.setUint32(2, file.length, true); v.setUint32(10, 14 + biSize + masks + colors * 4, true);
+  file.set(dib, 14);
+  const bmp = await createImageBitmap(new Blob([file], { type: "image/bmp" }));
+  const c = new OffscreenCanvas(bmp.width, bmp.height);
+  c.getContext("2d").drawImage(bmp, 0, 0);
+  return c.convertToBlob({ type: "image/png" });
+}
+async function blobToDib(blob) {
+  const bmp = await createImageBitmap(blob);
+  const w = bmp.width, h = bmp.height, c = new OffscreenCanvas(w, h), g = c.getContext("2d");
+  g.drawImage(bmp, 0, 0);
+  const rgba = g.getImageData(0, 0, w, h).data;
+  const dib = new Uint8Array(40 + w * h * 4), v = new DataView(dib.buffer);
+  v.setUint32(0, 40, true); v.setInt32(4, w, true); v.setInt32(8, h, true);   // positive height: bottom-up
+  v.setUint16(12, 1, true); v.setUint16(14, 32, true); v.setUint32(16, 0, true); v.setUint32(20, w * h * 4, true);
+  for (let y = 0; y < h; y++) {
+    const src = (h - 1 - y) * w * 4, dst = 40 + y * w * 4;
+    for (let x = 0; x < w * 4; x += 4) {
+      dib[dst + x] = rgba[src + x + 2]; dib[dst + x + 1] = rgba[src + x + 1];
+      dib[dst + x + 2] = rgba[src + x]; dib[dst + x + 3] = rgba[src + x + 3];
+    }
+  }
+  return dib;
+}
+async function signature(text, blob) {
+  const parts = [text || ""];
+  if (blob) parts.push(Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await blob.arrayBuffer()))).join(","));
+  return parts.join("|");
+}
+async function writeOut() {
+  const o = clip.out; clip.out = null;
+  if (!o) return;
+  const data = {};
+  if (o.text) data["text/plain"] = new Blob([o.text], { type: "text/plain" });
+  if (o.png) data["image/png"] = o.png;
+  clip.lastSig = await signature(o.text, o.png);
+  try { await navigator.clipboard.write([new ClipboardItem(data)]); clip.pending = null; }
+  catch (e) { clip.pending = o; }
+}
+const queueOut = (part) => {
+  if (!clipboardOn) return;   // text and image of one copy arrive separately: write them together
+  clip.out = Object.assign(clip.out || {}, part);
+  clearTimeout(clip.outTimer); clip.outTimer = setTimeout(writeOut, 200);
+};
+// RDP text has CRLF line ends: a paste into a terminal here would carry the CRs. Windows keeps them
+const onWindows = /^win/i.test(navigator.userAgentData?.platform || navigator.platform || "");
+const clipboardWrite = (text) => queueOut({ text: onWindows ? text : text.replace(/\r\n/g, "\n") });
+// The server's image arrives as a CF_DIB, or as PNG when the server offers PNG only (e.g. GNOME
+// Remote Desktop for a PNG-only source); a PNG needs no conversion.
+const clipboardWriteImage = (bytes, isPng) =>
+  (isPng ? Promise.resolve(new Blob([bytes], { type: "image/png" })) : dibToPng(bytes)).then((png) => queueOut({ png }),
+    (e) => log("[page] clipboard image from server not decodable: " + e.message));
+let clipboardOn = true;   // Session settings: off means -clipboard, and the page bridge stays quiet
+// How the browser's clipboard reaches the session. Chrome and Edge have a clipboard-read
+// permission: once it is given, navigator.clipboard.read() is silent, so the page reads on focus
+// and every 1.5 s, and a copy here is on the remote side before the user pastes there. Firefox and
+// Safari have no such permission (permissions.query() throws for it): each read() shows the
+// browser's own "Paste" button for the user to click, so polling showed that button all the time
+// (#368). There the page never reads by itself: it takes the clipboard from the user's paste, Ctrl
+// or Cmd + V on the session (below). A Chrome that refused the permission does the same.
+// clip.poll: null until the permission is known, then true (read on its own) or false (on paste).
+async function clipboardMode() {
+  try {
+    const s = await navigator.permissions.query({ name: "clipboard-read" });
+    const set = () => { clip.poll = s.state !== "denied"; };
+    set(); s.addEventListener?.("change", set);
+  } catch (e) { clip.poll = false; }
+  log(`[page] clipboard: ${clip.poll ? "read on focus and every 1.5 s" : "read on paste (Ctrl or Cmd + V)"}`);
+}
+clipboardMode();
+// the local clipboard's text and image to the session, unless it is what was last offered (or
+// written out by the session itself)
+async function offerLocal(text, png) {
+  if (!text && !png) return;
+  const sig = await signature(text, png);
+  if (sig === clip.lastSig) return;
+  let ptr = 0, len = 0;
+  if (png) {
+    try { const dib = await blobToDib(png); len = dib.length; ptr = Module._malloc(len); (Module.HEAPU8 ?? globalThis.HEAPU8).set(dib, ptr); }
+    catch (e) { log("[page] clipboard image not decodable: " + e.message); }
+  }
+  const ok = Module.ccall("freerdp_web_clipboard_offer", "number", ["string", "number", "number"], [text || null, ptr, len]);
+  if (ptr) Module._free(ptr);
+  if (ok) clip.lastSig = sig;
+}
+async function syncClipboard() {
+  if (!clipboardOn || !document.body.classList.contains("session") || !document.hasFocus()) return;
+  if (clip.pending) { clip.out = clip.pending; clip.pending = null; await writeOut(); return; }
+  if (clip.poll !== true) return;
+  let text = "", png = null;
+  try {
+    for (const item of await navigator.clipboard.read()) {
+      if (item.types.includes("text/plain")) text = await (await item.getType("text/plain")).text();
+      const img = item.types.find((t) => t.startsWith("image/"));
+      if (img) png = await item.getType(img);
+    }
+  } catch (e) {
+    try { text = await navigator.clipboard.readText(); }            // e.g. only text permission
+    catch (e2) { if (!clip.warned) { clip.warned = true; log("[page] clipboard read not allowed: " + e2.message); } return; }
+  }
+  await offerLocal(text, png);
+}
+window.addEventListener("focus", syncClipboard);
+setInterval(syncClipboard, 1500);
+// On paste (clip.poll false). Ctrl or Cmd + V on the canvas would reach the remote side at once,
+// before the browser's paste event says what is in the clipboard, and the remote app would paste
+// what was offered before. So the V is held back (not prevented: the browser's paste must still
+// happen), the paste event's text and image are offered, and then the held keys go to the client
+// in their order. No paste event within 300 ms (nothing pasteable, or a browser that gives none):
+// the keys go anyway. A paste of files is the Files code's (below).
+// Writing to the clipboard there needs a user gesture too: a copy from the session that the
+// browser refused (clip.pending) is written on the next key or click.
+const paste = { held: null, timer: 0 };
+function pasteRelease() {
+  const held = paste.held; paste.held = null; clearTimeout(paste.timer);
+  for (const [type, init] of held ?? []) synthKey(type, init);
+}
+const keyInit = (e) => ({ key: e.key, code: e.code, keyCode: e.keyCode, location: e.location, repeat: e.repeat,
+  ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey, metaKey: e.metaKey });
+for (const type of ["keydown", "keyup"]) window.addEventListener(type, (e) => {
+  if (synthetic || e.target !== $("canvas") || !document.body.classList.contains("session") || !clipboardOn) return;
+  if (clip.pending && type === "keydown") syncClipboard();   // in the gesture: write the session's copy out
+  if (clip.poll !== false) return;
+  if (!paste.held && type === "keydown" && e.code === "KeyV" && (e.ctrlKey || e.metaKey) && !e.altKey && !e.repeat) {
+    paste.held = []; paste.timer = setTimeout(pasteRelease, 300);
+  }
+  if (!paste.held) return;
+  e.stopImmediatePropagation();   // not preventDefault(): the browser's paste comes from this key
+  paste.held.push([type, keyInit(e)]);
+}, true);
+window.addEventListener("pointerdown", () => { if (clip.pending) syncClipboard(); }, true);
+window.addEventListener("paste", (e) => {
+  if (!paste.held) return;
+  const d = e.clipboardData;
+  if (d?.files?.length && filesSupported()) { pasteRelease(); return; }   // the Files code's (below)
+  e.preventDefault();
+  const item = [...(d?.items ?? [])].find((i) => i.kind === "file" && i.type.startsWith("image/"));
+  offerLocal(d?.getData("text/plain") || "", item?.getAsFile() ?? null)
+    .catch((err) => log("[page] clipboard paste not offered: " + err.message)).finally(pasteRelease);
+}, true);
+
+// Files. The browser's clipboard has no files for a page to read, so they come another way:
+//  - to the session: dropped on the page, pasted where the browser hands them over, or from the
+//    toolbar's Files. The page offers them as a copy; a paste in the session then asks for their
+//    contents, a piece at a time, and each piece is read from the File here: nothing waits in memory.
+//  - from the session: a copy of files shows a bar with Save. A page can't start a save on its
+//    own, so the click on Save fetches them, a piece at a time. Chrome and Edge write them to
+//    disk as they arrive: one file where the visitor says, several into a folder they pick.
+//    Elsewhere they collect in memory for a download, several as one ZIP (2 GiB at most).
+const CF = FreeRDPClipFiles;
+const filesState = { offered: null, offeredSize: 0, sent: 0, session: null, saving: false, stream: 0, waits: new Map(), shown: 0, hide: 0, drag: 0 };
+const FILE_PIECE = 1024 * 1024, FILE_WAIT_MS = 30000, MEMORY_SAVE_MAX = 2 * 2 ** 30;
+const filesSupported = () => CF.allowed(Module);
+// the server's answer comes after the session starts, and may change on a reconnect
+const filesToolbar = () => { $("tbFiles").hidden = !clipboardOn || !filesSupported(); };
+setInterval(filesToolbar, 1000);
+const heapCopy = (bytes) => { const ptr = Module._malloc(bytes.length); (Module.HEAPU8 ?? globalThis.HEAPU8).set(bytes, ptr); return ptr; };
+function filesShow(text, key, vars, save) {
+  clearTimeout(filesState.hide);
+  $("filesText").textContent = t(key, text, vars);
+  $("filesSave").hidden = !save;
+  $("filesBar").hidden = false;
+}
+const filesHide = () => { clearTimeout(filesState.hide); $("filesBar").hidden = true; };
+const filesDone = (text, key) => { filesShow(text, key); filesState.hide = setTimeout(filesHide, 5000); };
+const filesCount = (n) => t(n === 1 ? "files.one" : "files.many", n === 1 ? "1 file" : `${n} files`, { n });
+const filesFail = (text, key, vars) => { log("[page] files: " + text); filesShow(text, key, vars, false); };
+
+async function filesOffer(entries) {
+  if (!entries.length || !clipboardOn || !document.body.classList.contains("session") || !filesSupported()) return;
+  let list;
+  try { list = CF.buildList(entries); }
+  catch (e) {
+    if (!e.tooLong) throw e;
+    return filesFail(`The name is too long to copy: ${e.tooLong}`, "files.tooLong", { name: e.tooLong });
+  }
+  const ptr = heapCopy(list);
+  const ok = Module.ccall("freerdp_web_clipboard_offer_files", "number", ["number", "number"], [ptr, list.length]);
+  Module._free(ptr);
+  if (!ok) return filesFail("The session is not ready for files", "files.notReady");
+  const files = entries.filter((e) => !e.dir);
+  filesState.offered = entries; filesState.sent = 0; filesState.shown = 0;
+  filesState.offeredSize = files.reduce((n, e) => n + e.size, 0);
+  filesState.session = null;
+  log(`[page] files: offered ${files.length} files, ${filesState.offeredSize} bytes`);
+  const all = `${filesCount(files.length)}, ${CF.sizeText(filesState.offeredSize)}`;
+  filesShow(`${all} ready: paste in the session. If nothing arrives, this host may not take files.`, "files.ready", { all }, false);
+}
+function fileAnswerSend(stream, ok, bytes) {
+  const ptr = bytes?.length ? heapCopy(bytes) : 0;
+  Module.ccall("freerdp_web_clipboard_file_answer", "number", ["number", "number", "number", "number"], [stream, ok ? 1 : 0, ptr, bytes?.length ?? 0]);
+  if (ptr) Module._free(ptr);
+}
+// The server's paste reads our files. It may ask for any file, for any piece, any number of times.
+async function filesAnswer(stream, index, flags, low, high, size) {
+  const entry = filesState.offered?.[index];
+  if (!entry || entry.dir) return fileAnswerSend(stream, false);
+  try {
+    if (flags & CF.SIZE) {
+      const bytes = new Uint8Array(8), v = new DataView(bytes.buffer);
+      v.setUint32(0, entry.size % 2 ** 32, true); v.setUint32(4, Math.floor(entry.size / 2 ** 32), true);
+      return fileAnswerSend(stream, true, bytes);
+    }
+    const from = high * 2 ** 32 + low;
+    const bytes = new Uint8Array(await entry.file.slice(from, from + size).arrayBuffer());
+    fileAnswerSend(stream, true, bytes);
+    filesState.sent += bytes.length;
+    const now = performance.now();
+    if (filesState.sent >= filesState.offeredSize) filesDone("Copied to the session", "files.sent");
+    else if (now - filesState.shown > 250) {
+      filesState.shown = now;
+      const percent = Math.floor(100 * filesState.sent / filesState.offeredSize);
+      filesShow(`Copying to the session: ${percent} %`, "files.sending", { percent });
+    }
+  } catch (e) {
+    filesFail(`Cannot read ${entry.path}: ${e.message}`, "files.cannotRead", { name: entry.path });
+    fileAnswerSend(stream, false);
+  }
+}
+
+// The session copied. null: no files there any more
+function filesFromSession(bytes) {
+  if (filesState.saving) { filesState.session = null; return; }   // the save fails, and says so
+  if (!bytes) {
+    if (filesState.session) filesHide();
+    filesState.session = null;
+    return;
+  }
+  const list = CF.parseList(bytes);
+  if (!list) { log("[page] files: the server's list was refused"); return; }
+  filesState.session = list; filesState.offered = null;
+  log(`[page] files: the session offers ${list.files} files, ${list.size} bytes`);
+  filesShow(`${filesCount(list.files)}, ${CF.sizeText(list.size)}`, "files.offer",
+    { all: `${filesCount(list.files)}, ${CF.sizeText(list.size)}` }, true);
+}
+function filesData(stream, ok, bytes) {
+  const wait = filesState.waits.get(stream);
+  if (!wait) return;
+  filesState.waits.delete(stream); clearTimeout(wait.timer);
+  if (ok) wait.resolve(bytes); else wait.reject(new Error("the server refused"));
+}
+function filePiece(index, offset, size) {
+  return new Promise((resolve, reject) => {
+    const stream = filesState.stream = (filesState.stream + 1) % 2 ** 31;
+    const timer = setTimeout(() => { filesState.waits.delete(stream); reject(new Error("no answer")); }, FILE_WAIT_MS);
+    filesState.waits.set(stream, { resolve, reject, timer });
+    Module.ccall("freerdp_web_clipboard_file_fetch", "number", ["number", "number", "number", "number", "number", "number"],
+      [stream, index, CF.RANGE, offset % 2 ** 32, Math.floor(offset / 2 ** 32), size]);
+  });
+}
+// All of one file, in order, to sink(bytes), which may wait
+async function fileFetch(entry, progress, sink) {
+  for (let offset = 0; offset < entry.size;) {
+    const bytes = await filePiece(entry.index, offset, Math.min(FILE_PIECE, entry.size - offset));
+    if (!bytes.length) throw new Error("the file is shorter than listed");
+    await sink(bytes);
+    offset += bytes.length; progress(bytes.length);
+  }
+}
+async function saveToHandle(handle, entry, progress) {
+  const out = await handle.createWritable();
+  try { await fileFetch(entry, progress, (bytes) => out.write(bytes)); await out.close(); }
+  catch (e) { await out.abort().catch(() => {}); throw e; }
+}
+async function saveToFolder(folder, list, progress) {
+  // nothing here is overwritten: what is at the top gets a free name
+  const here = new Set(), tops = new Map();
+  for await (const name of folder.keys()) here.add(name);
+  for (const e of list.entries) {
+    const top = e.path.split("/")[0];
+    if (tops.has(top)) continue;
+    const free = CF.freeName(top, (name) => here.has(name));
+    here.add(free); tops.set(top, free);
+  }
+  for (const e of list.entries) {
+    const parts = e.path.split("/");
+    parts[0] = tops.get(parts[0]);
+    const name = parts.pop();
+    let dir = folder;
+    for (const part of parts) dir = await dir.getDirectoryHandle(part, { create: true });
+    if (e.dir) await dir.getDirectoryHandle(name, { create: true });
+    else await saveToHandle(await dir.getFileHandle(name, { create: true }), e, progress);
+  }
+}
+function saveDownload(blob, name) {
+  const a = document.createElement("a"), url = URL.createObjectURL(blob);
+  a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+async function saveInMemory(list, single, progress) {
+  if (single) {
+    const parts = [];
+    await fileFetch(single, progress, (bytes) => { parts.push(bytes); });
+    return saveDownload(new Blob(parts), single.path.split("/").pop());
+  }
+  const parts = [], central = [];
+  let at = 0;
+  for (const e of list.entries) {
+    const pieces = [];
+    let crc = 0;
+    if (!e.dir) await fileFetch(e, progress, (bytes) => { crc = CF.crc32(crc, bytes); pieces.push(bytes); });
+    const z = CF.zipEntry(e.path, crc, e.dir ? 0 : e.size, at, e.dir);
+    parts.push(z.local, ...pieces); central.push(z.central);
+    at += z.local.length + (e.dir ? 0 : e.size);
+  }
+  const size = central.reduce((n, c) => n + c.length, 0);
+  saveDownload(new Blob([...parts, ...central, CF.zipEnd(central.length, size, at)], { type: "application/zip" }), "copied-files.zip");
+}
+async function filesSave() {
+  const list = filesState.session;
+  if (!list || filesState.saving) return;
+  const single = list.entries.length === 1 ? list.entries[0] : null;
+  const streaming = single ? !!window.showSaveFilePicker : !!window.showDirectoryPicker;
+  if (!streaming && list.size > MEMORY_SAVE_MAX)
+    return filesFail(`Too large for this browser: ${CF.sizeText(list.size)}. Chrome or Edge can save it.`, "files.tooLarge", { size: CF.sizeText(list.size) });
+  filesState.saving = true;
+  let done = 0, shown = 0;
+  const progress = (n) => {
+    done += n;
+    const now = performance.now();
+    if (now - shown < 250) return;
+    shown = now;
+    const percent = list.size ? Math.floor(100 * done / list.size) : 100;
+    filesShow(`Saving: ${percent} %`, "files.saving", { percent });
+  };
+  try {
+    if (single && window.showSaveFilePicker) await saveToHandle(await showSaveFilePicker({ suggestedName: single.path }), single, progress);
+    else if (!single && window.showDirectoryPicker) await saveToFolder(await showDirectoryPicker({ mode: "readwrite", id: "freerdp-files" }), list, progress);
+    else await saveInMemory(list, single, progress);
+    log(`[page] files: saved ${list.files} files, ${done} bytes`);
+    filesDone("Saved", "files.saved");
+    filesState.session = null;
+  } catch (e) {
+    filesState.saving = false;
+    if (e.name === "AbortError") filesFromSession(CF.buildList(list.entries));   // no choice made: as before
+    else { filesState.session = null; filesFail(`Not saved: ${e.message}. Copy again in the session.`, "files.notSaved"); }
+  } finally { filesState.saving = false; backToCanvas(); }
+}
+$("filesSave").onclick = filesSave;
+$("filesClose").onclick = () => { filesHide(); backToCanvas(); };
+$("tbFiles").onclick = () => { $("filesPick").value = ""; $("filesPick").click(); };
+$("filesPick").onchange = () => { filesOffer(CF.fromFiles($("filesPick").files)).catch((e) => filesFail(e.message, "files.notReady")); backToCanvas(); };
+// A drag of files over a session, on the page or the canvas. Anything else stays as it is.
+const dragHasFiles = (e) => document.body.classList.contains("session") && clipboardOn && filesSupported() && !!e.dataTransfer?.types?.includes("Files");
+// A drag over the page keeps sending dragover: when they stop, it was cancelled or left.
+const dropHide = () => { clearTimeout(filesState.drag); $("filesDrop").hidden = true; };
+const dragOver = (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault(); e.dataTransfer.dropEffect = "copy";
+  $("filesDrop").hidden = false;
+  clearTimeout(filesState.drag); filesState.drag = setTimeout(dropHide, 1000);
+};
+window.addEventListener("dragenter", dragOver, true);
+window.addEventListener("dragover", dragOver, true);
+window.addEventListener("dragleave", (e) => { if (!e.relatedTarget) dropHide(); }, true);
+window.addEventListener("drop", (e) => {
+  dropHide();
+  if (!dragHasFiles(e)) return;
+  e.preventDefault(); e.stopPropagation();
+  CF.fromItems(e.dataTransfer.items).then(filesOffer).catch((err) => filesFail(err.message, "files.notReady"));
+  backToCanvas();
+}, true);
+window.addEventListener("paste", (e) => {
+  if (!e.clipboardData?.files?.length || !document.body.classList.contains("session") || !clipboardOn || !filesSupported()) return;
+  e.preventDefault();
+  CF.fromItems(e.clipboardData.items).then(filesOffer).catch((err) => filesFail(err.message, "files.notReady"));
+}, true);
+
+// Session toolbar. A button click is always a valid user gesture for full screen.
+const toolbar = $("toolbar");
+const backToCanvas = () => setTimeout(() => $("canvas").focus(), 0);
+$("tbFs").onclick = () => { toggleFullscreen(); backToCanvas(); };
+$("tbLog").onclick = () => { const d = $("logPanel"); d.open = !d.open; backToCanvas(); };
+function disconnect() { crash.userEnded = true; again.forget(); if (crash.running) crashEnd(false, ""); location.reload(); }
+$("tbQuit").onclick = disconnect;
+$("tbReconnect").onclick = () => { reconnect(); backToCanvas(); };
+// 📌 keeps the toolbar visible in full screen (remembered across sessions)
+const showPinTitle = () => { $("tbPin").title = document.body.classList.contains("tbpinned")
+  ? t("tb.unpinTitle", "Unpin toolbar (auto-hide in full screen)") : t("tb.pinTitle", "Pin toolbar (always visible)"); };
+const setPinned = (on) => { document.body.classList.toggle("tbpinned", on); $("tbPin").classList.toggle("on", on);
+  showPinTitle();
+  try { localStorage.setItem("freerdp-web-tbpinned", on ? "1" : "0"); } catch (e) {} };
+let pinned0 = false; try { pinned0 = localStorage.getItem("freerdp-web-tbpinned") === "1"; } catch (e) {}
+setPinned(pinned0);
+$("tbPin").onclick = () => { setPinned(!document.body.classList.contains("tbpinned")); backToCanvas(); };
+$("tbInfo").onclick = () => { $("info").hidden = !$("info").hidden; updateInfo(); backToCanvas(); };
+$("tbAbout").onclick = () => { const d = $("aboutPanel"); d.open = !d.open; backToCanvas(); };
+
+// ---- All screens: the remote desktop across every screen (screens.js has the geometry). The
+// Window Management API (Chrome, Edge) lists the screens and places windows on them: this window
+// goes full screen on its own screen and opens a window on each other one (screen.html), which
+// shows its part of the canvas and hands its mouse and keys back here. The canvas spans all of
+// them, so SDL follows its size and /dynamic-resolution makes the remote desktop that large.
+// Those windows copy the canvas with drawImage(). SDL draws with WebGL, whose canvas reads back
+// empty outside the frame that drew it unless the context keeps its drawing buffer
+// (preserveDrawingBuffer), so the page asks for that where the browser sees more than one screen
+// when it loads; one screen costs nothing. A window copies its part when the canvas's capture
+// stream has a new frame, i.e. when SDL presented one: an idle desktop costs nothing either. The
+// stream alone would not do: it has no frame for a canvas that is not drawn again, so a window
+// opened on an idle desktop would stay black. (A screen connected after the page loaded: its
+// window shows the stream's frames, and a part of the desktop only once it changes.)
+// The browser allows one new window per click, so more than two screens can take more clicks.
+// ?screens=WxH+X+Y,… sets the screens by hand (tests), this window on the first, no full screen.
+const screensSpec = FreeRDPScreens.parse(new URLSearchParams(location.search).get("screens"));
+const multi = { screens: null, cur: 0, box: null, wins: new Map(), details: null, poll: 0, toast: 0, stream: null, resends: 0, mode: "separate" };
+const multiOn = () => !!multi.box;
+const screensReadable = !!screensSpec || !!window.screen.isExtended;
+if (screensReadable) {
+  const getContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+    if (this.id === "canvas" && /^webgl/.test(type)) attrs = { ...attrs, preserveDrawingBuffer: true };
+    return getContext.call(this, type, attrs);
+  };
+}
+const screensWaiting = () => multiOn() && multi.screens.some((s, i) => i !== multi.cur && !multi.wins.has(i));
+function showScreensButton() {
+  $("tbScreens").hidden = !screensSpec && !(window.screen.isExtended && "getScreenDetails" in window) && !multiOn();
+  $("tbScreens").textContent = !multiOn() ? t("tb.screens", "All screens ▾") : screensWaiting() ? t("tb.nextScreen", "Next screen") : t("tb.oneScreen", "One screen");
+}
+window.screen.addEventListener?.("change", showScreensButton); showScreensButton();
+// the log keeps the English; the toast says it in the visitor's language (key and vars: i18n.js)
+function screensSay(text, key, vars) {
+  log("[page] " + text);
+  clearTimeout(multi.toast); $("screensToast").textContent = t(key, text, vars); $("screensToast").hidden = false;
+  multi.toast = setTimeout(() => { $("screensToast").hidden = true; }, 6000);
+}
+async function screensOn() {
+  if (!multiOn()) multi.mode = readSession().screens;   // Session settings, All screens
+  if (!multi.screens) {
+    if (screensSpec) multi.screens = screensSpec;
+    else {
+      try { multi.details ??= await window.getScreenDetails(); }
+      catch (e) { screensSay("The other screens are not available: " + e.message, "screens.unavailable", { why: e.message }); return; }
+      const d = multi.details;
+      multi.screens = d.screens.map((s) => ({ left: s.left, top: s.top, width: s.width, height: s.height, label: s.label || t("screens.screen", "Screen"), screen: s }));
+      multi.cur = d.screens.indexOf(d.currentScreen);
+      d.onscreenschange = () => { if (multiOn()) { screensOff(); screensSay("The screens changed: the remote desktop is back on this one.", "screens.changed"); } };
+    }
+    if (multi.screens.length < 2) { multi.screens = null; screensSay("Only one screen is connected.", "screens.one"); return; }
+  }
+  // the permission prompt may have used up the click: full screen then asks for another one
+  if (!screensSpec && !document.fullscreenElement && !await enterFullscreen(multi.screens[multi.cur].screen)) {
+    multi.screens = null; screensSay("Full screen needs a click: click All screens again.", "screens.click"); return;
+  }
+  const s = multi.screens.find((x, i) => i !== multi.cur && !multi.wins.has(i)), i = multi.screens.indexOf(s);
+  if (!s) return;
+  const at = s.screen ? [s.screen.availLeft, s.screen.availTop, s.screen.availWidth, s.screen.availHeight] : [s.left, s.top, s.width, s.height];
+  const w = window.open("screen.html#" + i, "freerdp-screen-" + i, `popup,left=${at[0]},top=${at[1]},width=${at[2]},height=${at[3]}`);
+  if (!w) {   // the click went to the permission prompt or to full screen, or pop-ups are blocked
+    screensSay(`The browser did not open the window for ${s.label}: click ${multiOn() ? "Next screen" : "All screens"} again, or allow pop-ups for this site.`,
+      "screens.blocked", { label: s.label, button: multiOn() ? t("tb.nextScreen", "Next screen") : t("set.screens", "All screens") });
+    if (!multiOn()) multi.screens = null;
+    return;
+  }
+  multi.wins.set(i, w);
+  clearInterval(multi.poll); multi.poll = setInterval(screensCheck, 500);
+  screensLayout();
+  if (screensWaiting()) screensSay(`${s.label}: click it to fill it. Click Next screen for the next one.`, "screens.fillNext", { label: s.label });
+  else screensSay(`${s.label}: click it to fill it with the remote desktop.`, "screens.fill", { label: s.label });
+}
+// A window closed: the desktop shrinks to the rest. SDL takes the canvas's size only once FreeRDP
+// made its window resizable (when the display channel is up), and a resize event before that is
+// lost: send another until the canvas has the size it is shown at, 10 at most (each one clears
+// the canvas; SDL keeps the window's size for a window it holds full screen itself).
+function screensCheck() {
+  if ([...multi.wins.values()].some((w) => w.closed)) { screensLayout(); return; }
+  const c = $("canvas"), r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  if (!document.body.classList.contains("session") || (Math.abs(r.width * dpr - c.width) <= 2 && Math.abs(r.height * dpr - c.height) <= 2)) return;
+  if (++multi.resends <= 10) window.dispatchEvent(new Event("resize"));
+  else if (multi.resends === 11) log(`[page] screens: the client keeps its picture at ${c.width} × ${c.height}, not ${Math.round(r.width * dpr)} × ${Math.round(r.height * dpr)}`);
+}
+function screensLayout() {
+  for (const [i, w] of multi.wins) if (w.closed) multi.wins.delete(i);
+  if (!multi.wins.size) { screensOff(); return; }
+  multi.box = FreeRDPScreens.box([multi.cur, ...multi.wins.keys()].map((i) => multi.screens[i]));
+  const p = FreeRDPScreens.place(multi.screens[multi.cur], multi.box), st = document.documentElement.style;
+  for (const k of ["left", "top", "width", "height"]) st.setProperty("--m" + k, p[k] + "px");
+  document.body.classList.add("multi"); multi.resends = 0;
+  log(`[page] screens: ${multi.wins.size + 1} in use (${multi.mode === "separate" ? "separate monitors" : "one wide desktop"}), the remote desktop spans ${multi.box.width} × ${multi.box.height} (CSS pixels)`);
+  screensResized();
+}
+function screensOff() {
+  clearInterval(multi.poll);
+  for (const w of multi.wins.values()) try { w.close(); } catch (e) { /* closed */ }
+  const was = multiOn();
+  multi.wins.clear(); multi.box = null; multi.screens = null;
+  multi.stream?.getTracks().forEach((t) => t.stop()); multi.stream = null;
+  document.body.classList.remove("multi");
+  if (was) { log("[page] screens: back to one"); screensResized(); }
+}
+// Separate screens: the screens in use as monitors, their edges as fractions of the canvas (it
+// spans their bounding box), this window's screen the primary one. FreeRDP asks on each
+// resize and sends them in its display layout; null leaves it one monitor (One wide desktop).
+function screensMonitors() {
+  if (!multiOn() || multi.mode !== "separate") return null;
+  const b = multi.box;
+  return [multi.cur, ...multi.wins.keys()].map((i) => {
+    const s = multi.screens[i];
+    return { left: (s.left - b.left) / b.width, top: (s.top - b.top) / b.height,
+      right: (s.left + s.width - b.left) / b.width, bottom: (s.top + s.height - b.top) / b.height, primary: i === multi.cur };
+  });
+}
+// SDL measures the canvas on a resize event; the disp channel sends the new layout after that
+function screensResized() { showScreensButton(); requestAnimationFrame(() => { placeToolbar(); window.dispatchEvent(new Event("resize")); }); }
+// All screens asks for the mode first (Separate screens or One wide desktop); the choice is the
+// click full screen and the new window need, and it is kept as this host's setting. Next screen
+// and One screen act at once.
+$("tbScreens").onclick = () => {
+  if (!multiOn()) { showScreensMenu(); return; }
+  if (screensWaiting()) screensOn(); else screensOff();
+  backToCanvas();
+};
+function showScreensMenu(show = $("screensMenu").hidden) {
+  const m = $("screensMenu");
+  m.hidden = !show;
+  if (!show) return;
+  const r = $("tbScreens").getBoundingClientRect();
+  m.style.left = r.left + "px"; m.style.top = r.bottom + 4 + "px";
+  const mode = readSession().screens;
+  for (const b of m.querySelectorAll("button")) b.classList.toggle("current", b.dataset.mode === mode);
+  m.querySelector(`[data-mode="${mode}"]`).focus();
+}
+for (const b of document.querySelectorAll("#screensMenu button")) b.onclick = () => {
+  showScreensMenu(false);
+  setRadio("screens", b.dataset.mode); HostsUI.update({ session: readSession() }); updateSessionText();
+  log(`[page] screens: ${b.dataset.mode === "separate" ? "separate screens" : "one wide desktop"} chosen`);
+  screensOn(); backToCanvas();
+};
+document.addEventListener("pointerdown", (e) => { if (!$("screensMenu").hidden && !e.target.closest("#screensMenu, #tbScreens")) showScreensMenu(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("screensMenu").hidden) { showScreensMenu(false); backToCanvas(); } });
+window.addEventListener("pagehide", screensOff);
+// what the windows on the other screens use (screen.js)
+window.freerdpScreens = {
+  // what window n shows: the canvas (readable: it keeps its drawing buffer), its stream, its part
+  // of it (canvas pixels) and the remote pointer's image; null once it is no longer part of the
+  // desktop, and the window closes. Under capture the browser shows no cursor at all and the
+  // page draws its own (#vcursor, above) in this window only: "locked" says where it is, in
+  // canvas pixels, so the window whose part holds it draws it too
+  view(n) {
+    if (!multiOn() || !multi.wins.has(n)) return null;
+    const c = $("canvas"), s = multi.screens[n], vc = $("vcursor");
+    multi.stream ??= c.captureStream();
+    let locked = null;
+    if (pointerLocked() && !vc.hidden) {
+      const r = c.getBoundingClientRect();
+      locked = { x: cap.x * c.width / r.width, y: cap.y * c.height / r.height, src: vc.src, hotX: cap.hotX, hotY: cap.hotY };
+    }
+    return { canvas: c, readable: screensReadable, stream: multi.stream, cursor: c.style.cursor, locked, label: s.label, ...FreeRDPScreens.slice(s, multi.box, c.width, c.height) };
+  },
+  // a mouse event (at fx, fy: fractions of its screen) or a key event of window n, to SDL
+  input(n, type, init) {
+    if (!multiOn() || !multi.wins.has(n) || !document.body.classList.contains("session")) return;
+    if (type === "keydown" || type === "keyup") { dispatchToSdl(new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init })); return; }
+    const { x, y } = FreeRDPScreens.toCanvas(init, multi.screens[n], multi.box, $("canvas").getBoundingClientRect());
+    const ev = { bubbles: true, cancelable: true, clientX: x, clientY: y, screenX: x, screenY: y, button: init.button ?? 0, buttons: init.buttons ?? 0,
+      ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey, altKey: !!init.altKey, metaKey: !!init.metaKey };
+    const pointer = { ...ev, pointerId: 1, pointerType: "mouse", isPrimary: true };
+    if (type === "wheel") dispatchToSdl(new WheelEvent("wheel", { ...ev, deltaX: init.deltaX, deltaY: init.deltaY, deltaMode: init.deltaMode }));
+    else if (type === "mouseenter") dispatchToSdl(new PointerEvent("pointerenter", { ...pointer, bubbles: false }));
+    else {   // SDL 3.4 reads pointer events, SDL 3.2 mouse events (as under Capture, above)
+      dispatchToSdl(new PointerEvent(POINTER_TYPE[type], pointer));
+      dispatchToSdl(new MouseEvent(type, ev));
+    }
+  },
+  // window n has the focus: tell SDL its window has it, or it would drop the keys
+  focus(n) {
+    if (!multi.wins.has(n)) return;
+    synthetic = true;
+    try { window.dispatchEvent(new FocusEvent("focus")); } finally { synthetic = false; }
+  },
+};
+
+let last = { t: performance.now(), rx: 0, tx: 0, video: {} };
+// the frames of a codec family ("av01", "avc1"): counted by the page (decode-stats.js); a client
+// whose FreeRDP keeps its own AV1 counters (Module.freerdpAv1.stats) is read instead
+const decodeStats = (family) => (family === "av01" && Module.freerdpAv1?.stats) || window.freerdpDecodeStats?.[family];
+// the AV1 stream's profile, from its last sequence header (av1_webcodecs.js): 0 = Main, 4:2:0;
+// 1 = High, 4:4:4
+const av1Profile = () => { let p = -1; for (const d of Module.freerdpAv1?.decoders?.values() ?? []) if (d.profile >= 0) p = d.profile; return p; };
+const AV1_CHROMA = { 0: "4:2:0", 1: "4:4:4" };
+// FreeRDP's own counters (client-stats.js): one reading, or null with a client that has none. The
+// names are looked up once per client
+let statsNames = null;
+function clientStats() {
+  const cs = window.freerdpClientStats;
+  if (!cs) return null;
+  statsNames ??= cs.index(Module);
+  return statsNames ? cs.read(Module, statsNames) : null;
+}
+// Info: the live session only, refreshed every second while shown. What the client was built
+// with (its version, engine, FreeRDP, SDL, the decoders it has) is About's (about.js)
+function updateInfo() {
+  if ($("info").hidden) return;
+  const now = performance.now(), dt = (now - last.t) / 1000 || 1;
+  const net = window.freerdpNet || { rx: 0, tx: 0 };
+  // "12.0 /s, 345 total (3 key)" and "4.1 ms/frame (avg 4.5)" for a codec family, "–" before its first frame
+  const video = {};
+  const frameRows = (family) => {
+    const c = decodeStats(family); if (!c?.frames) return ["–", "–"];
+    const p = last.video[family] || { frames: 0, decodeMs: 0 };
+    video[family] = { frames: c.frames, decodeMs: c.decodeMs };
+    const fps = (c.frames - p.frames) / dt;
+    const dms = c.frames > p.frames ? (c.decodeMs - p.decodeMs) / (c.frames - p.frames) : 0;
+    return [t("info.frames", `${fps.toFixed(1)} /s, ${c.frames} total (${c.keyFrames} key)`, { fps: fps.toFixed(1), n: c.frames, key: c.keyFrames }),
+      t("info.decodeMs", `${dms.toFixed(1)} ms/frame (avg ${(c.decodeMs / c.frames).toFixed(1)})`,
+        { ms: dms.toFixed(1), avg: (c.decodeMs / c.frames).toFixed(1) })];
+  };
+  const [av1Frames, av1Decode] = frameRows("av01"), [h264Frames, h264Decode] = frameRows("avc1");
+  const kbit = (b) => (b * 8 / 1000 / dt).toFixed(0) + " kbit/s";
+  const mb = (b) => (b / 1e6).toFixed(1) + " MB";
+  const net2 = (rate, total) => t("info.net", `${rate}, ${total} total`, { rate, total });
+  const dur = info.started ? Math.floor((Date.now() - info.started) / 1000) : 0;
+  const stats = clientStats(), cs = window.freerdpClientStats;
+  // per second, or "–" for a counter that started again after a reconnect
+  const per = (v) => (v === null ? "–" : v.toFixed(1));
+  const statsNet = stats && cs.network(stats), statsAudio = stats && cs.audio(stats, last.stats, dt);
+  const rdpNet = stats && cs.rdpBytes(stats, last.stats, dt);
+  const kbitPer = (v) => (v === null ? "–" : (v * 8 / 1000).toFixed(0) + " kbit/s");
+  const notMeasured = t("info.notMeasured", "not measured");
+  // Item 8 batch B: the server as the protocol tells it, the same rows and words as the SDL overlay
+  // (comp-sdl-g1's reader: the numbers, the strings, and the library's names for the numbers)
+  const srv = stats && cs.server(stats, cs.strings(Module));
+  const named = (fn, fallback, ...args) => (typeof Module["_" + fn] === "function" ? Module.ccall(fn, "string", args.map(() => "number"), args) || fallback : fallback);
+  const hex = (v) => "0x" + v.toString(16).padStart(8, "0");
+  const rdpVersionName = (v) => named("freerdp_web_rdp_version_name", hex(v), v);
+  const codecName = (id) => (id === null ? t("info.surfaceNone", "no picture yet") : named("freerdp_web_codec_name", hex(id), id, srv?.capsVersion ?? 0));
+  const surfaceRows = srv ? srv.surfaceList.map((x) => [t("info.surface", `Surface ${x.slot}`, { n: x.slot }),
+    t("info.surfaceValue", `${x.width} × ${x.height}, ${codecName(x.codecId)}`, { w: x.width, h: x.height, codec: codecName(x.codecId) })]) : [];
+  if (srv?.moreSurfaces) surfaceRows.push([t("info.moreSurfaces", "Surfaces"), t("info.moreSurfacesValue", `+${srv.moreSurfaces} more`, { n: srv.moreSurfaces })]);
+  const rows = [
+    // where this client connected: FreeRDP's own host and port (on the web: the WebSocket gateway)
+    srv?.host ? [t("info.host", "Host"), srv.port ? `${srv.host}:${srv.port}` : srv.host] : [t("info.server", "Server"), info.server],
+    [t("info.transport", "Transport"), info.transport],
+    [t("info.rdpVersion", "RDP version"), srv?.rdpVersion ? (srv.rdpVersionServer && srv.rdpVersionServer !== srv.rdpVersion
+      ? t("info.rdpVersionBoth", `${rdpVersionName(srv.rdpVersion)} (server ${rdpVersionName(srv.rdpVersionServer)})`, { v: rdpVersionName(srv.rdpVersion), server: rdpVersionName(srv.rdpVersionServer) })
+      : rdpVersionName(srv.rdpVersion)) : null],
+    [t("info.serverOs", "Server OS"), srv?.osMajor ? named("freerdp_web_os_name", `${srv.osMajor} / ${srv.osMinor ?? 0}`, srv.osMajor, srv.osMinor ?? 0) : null],
+    [t("info.gfxCaps", "Graphics caps"), srv?.capsVersion ? t("info.gfxCapsValue", `${named("freerdp_web_caps_version_name", hex(srv.capsVersion), srv.capsVersion)}, flags: ${named("freerdp_web_caps_flags_name", hex(srv.capsFlags ?? 0), srv.capsFlags ?? 0)}`,
+      { caps: named("freerdp_web_caps_version_name", hex(srv.capsVersion), srv.capsVersion), flags: named("freerdp_web_caps_flags_name", hex(srv.capsFlags ?? 0), srv.capsFlags ?? 0) }) : null],
+    ...surfaceRows,
+    [t("info.certificate", "Certificate"), srv?.certificate ?? null],
+    [t("info.resolution", "Resolution"), `${$("canvas").width} × ${$("canvas").height}`],
+    [t("info.canvas", "Canvas"), (() => { const c = $("canvas"), b = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+      const bw = Math.round(b.width * dpr), bh = Math.round(b.height * dpr);
+      const same = Math.abs(bw - c.width) <= 2 && Math.abs(bh - c.height) <= 2;
+      const aspect = (bw / bh).toFixed(2), picture = (c.width / c.height).toFixed(2);
+      return same ? t("info.canvasSame", `${bw} × ${bh} on screen, matches`, { w: bw, h: bh }) :
+        t("info.canvasOff", `⚠ ${bw} × ${bh} on screen, aspect ${aspect} vs picture ${picture}`, { w: bw, h: bh, aspect, picture }); })()],
+    // per RDP graphics codec, what the server sent: the client's own counters, read by
+    // codec-stats.js (layout 2); the row hides with a client that has none, or a layout this page
+    // doesn't know
+    [t("info.codecs", "Video codecs"), (() => {
+      const cs = window.freerdpCodecStats;
+      if (!cs || typeof Module._freerdp_web_codec_stats !== "function") return null;
+      const now = cs.read(Module.HEAPU8, Module._freerdp_web_codec_stats()); if (!now) return null;
+      const prev = last.codecs?.length === now.length ? last.codecs : null;
+      last.codecsNext = now;
+      // the chroma from FreeRDP's own decoder (RDPGFX_CODECID_AV1_CHROMA), as the SDL overlay shows it.
+      // Until clients have that name (comp-sdl-g1's part, next FreeRDP), the page's own reading stands in
+      // for a client without it, so "4:4:4" does not vanish meanwhile; it goes once they all have it
+      const chroma = stats?.RDPGFX_CODECID_AV1_CHROMA !== undefined
+        ? window.freerdpClientStats?.chromaName(stats.RDPGFX_CODECID_AV1_CHROMA) ?? undefined
+        : AV1_CHROMA[av1Profile()];
+      return cs.describe(now, prev, dt, chroma) || t("info.noUpdates", "no updates yet"); })()],
+    [t("info.screens", "Screens"), (() => {
+      if (!multiOn()) return t("info.thisScreen", "this one");
+      const n = multi.wins.size + 1, w = multi.box.width, h = multi.box.height;
+      const mode = multi.mode === "separate" ? t("info.monitorEach", "a monitor each") : t("screens.span", "one wide desktop");
+      return t("info.screensSpan", `${n}, ${multi.mode === "separate" ? "a monitor each" : "one wide desktop"}; the desktop spans ${w} × ${h} CSS px`, { n, mode, w, h }); })()],
+    [t("info.av1", "AV1 decoder"), (() => {
+      if (!/^WebCodecs/.test(info.decoder)) return /dav1d/.test(info.decoder) ? t("info.dav1d", `${info.decoder}: software, in this page`, { decoder: info.decoder }) : info.decoder;
+      const p = av1Profile();
+      if (p < 0) return info.decoder;
+      const hw = hwText(hardware(p === 1 ? "av01.1.13M.08" : "av01.0.13M.08"));
+      return t("info.av1WebCodecs", `WebCodecs (browser), ${hw} for AV1 ${AV1_CHROMA[p]}`, { hw, chroma: AV1_CHROMA[p] }); })()],
+    [t("info.h264", "H.264 decoder"), (() => {
+      if (!Module.freerdpH264?.decoders?.size) return "–";
+      // the stream's own codec string is not kept; a High profile one (level 4.0) stands for it
+      const hw = hwText(hardware("avc1.640028"));
+      return t("info.h264WebCodecs", `WebCodecs (browser), ${hw}`, { hw }); })()],
+    // the sound format the server chose: FreeRDP's _freerdp_web_audio_format() (format tag, rate,
+    // channels), which only the old wasm-vault FreeRDP exported, so the row hides without it (as
+    // "Video codecs" did, 20261103.3). The client is a module: read through Module.HEAPU8, its
+    // HEAPU32 is not the page's
+    [t("info.audioCodec", "Audio codec"), (() => {
+      if (typeof Module._freerdp_web_audio_format !== "function") return null;
+      const a = Module._freerdp_web_audio_format(), heap = Module.HEAPU8;
+      if (!a || a % 4 || !heap?.buffer || heap.byteOffset + a + 12 > heap.buffer.byteLength) return "–";
+      const [tag, rate, ch] = new Uint32Array(heap.buffer, heap.byteOffset + a, 3);
+      if (!tag) return t("info.noAudio", "no audio yet");
+      const name = { 0x0001: "PCM", 0x704F: "Opus", 0xA106: "AAC", 0x0002: "ADPCM", 0x0011: "IMA ADPCM" }[tag] ?? "0x" + tag.toString(16);
+      return `${name}, ${rate / 1000} kHz, ${ch === 2 ? t("info.stereo", "stereo") : ch === 1 ? t("info.mono", "mono") : t("info.channels", ch + " ch", { n: ch })}`; })()],
+    // the page's own count, for a client without FreeRDP's: two times for one picture, measured
+    // differently, would explain nothing (FreeRDP's "AV1 results" row is above)
+    ...(stats && cs.hasDecoders(stats) ? [] : [[t("info.av1Frames", "AV1 frames"), av1Frames], [t("info.av1Decode", "AV1 decode"), av1Decode]]),
+    // H.264's rows only once H.264 pictures arrive (most sessions are AV1)
+    ...(h264Frames === "–" ? [] : [[t("info.h264Frames", "H.264 frames"), h264Frames], [t("info.h264Decode", "H.264 decode"), h264Decode]]),
+    // each decoder FreeRDP has used, by its own counters: what became a picture and what did not.
+    // The caps version the server confirmed says whether AV1's are AV2's: FreeRDP's own
+    // GFX_CAPS_VERSION when the client has it, else the web client's (codec-stats.js [1])
+    ...(stats ? cs.decoders(stats, last.stats, dt, cs.capsVersion(stats) ?? codecReading()?.[1]).map((d) => {
+      const hw = d.hardware === null ? "" : `, ${d.hardware ? t("info.hardware", "hardware") : t("info.software", "software")}`;
+      const rate = per(d.perSecond), avg = d.avgMs.toFixed(1), max = d.maxMs.toFixed(1), name = d.label;
+      return [t("info.decoderStats", `${name} results`, { name }),
+        t("info.decoderValue", `pictures: ${d.pictures} (${rate} /s), failed: ${d.failed}, no picture: ${d.noPicture}; ${avg} ms per attempt, ${max} ms max`,
+          { n: d.pictures, rate, failed: d.failed, none: d.noPicture, avg, max }) +
+          // key frames and fallbacks only from a client that still counts them (null: not counted)
+          (d.keyFrames === null ? "" : t("info.decoderKeyFrames", `, key frames: ${d.keyFrames}`, { key: d.keyFrames })) + hw +
+          (d.fallbacks ? t("info.decoderFallbacks", `, ${d.fallbacks} fallbacks`, { n: d.fallbacks }) : "")];
+    }) : []),
+    [t("info.audio", "Audio"), (() => { const c = Module.freerdpAudioContext, a = Module.freerdpAudio;
+      if (!c) return "–";
+      const q = a ? Math.max(0, Math.round((a.next - c.currentTime) * 1000)) : 0;
+      return `${c.state}, ${a ? t("info.queued", q + " ms queued", { ms: q }) : t("info.noData", "no data yet")}`; })()],
+    [t("info.audioIn", "Audio received"), statsAudio ? t("info.audioInValue", `${per(statsAudio.perSecond)} /s, ${statsAudio.waves} total, ${statsAudio.dropped} dropped, ${statsAudio.delayMs} ms delay`,
+      { rate: per(statsAudio.perSecond), n: statsAudio.waves, dropped: statsAudio.dropped, ms: statsAudio.delayMs }) : null],
+    // the rate from the last reading, the total for this session only (info.netBase)
+    [t("info.netIn", "Network in"), net2(kbit(net.rx - last.rx), mb(net.rx - info.netBase.rx))],
+    [t("info.netOut", "Network out"), net2(kbit(net.tx - last.tx), mb(net.tx - info.netBase.tx))],
+    // RDP's own bytes (FreeRDP's NETWORK_BYTES_*, above TLS): the rows above less TLS and the
+    // WebSocket; the total since the client connected. Hidden for a client without them
+    [t("info.netInRdp", "Network in (RDP)"), rdpNet ? net2(kbitPer(rdpNet.rxPerSecond), mb(rdpNet.rx)) : null],
+    [t("info.netOutRdp", "Network out (RDP)"), rdpNet ? net2(kbitPer(rdpNet.txPerSecond), mb(rdpNet.tx)) : null],
+    // the server's own measurements: a client without them hides the rows, and 0 is not measured,
+    // for now or for good: not every server measures (xrdp 0.10 here did not)
+    [t("info.rtt", "Round trip (measured by the server)"), statsNet ? (statsNet.rtt ? t("info.rttValue", `${statsNet.rtt} ms (lowest ${statsNet.rttBase})`, { ms: statsNet.rtt, base: statsNet.rttBase }) : notMeasured) : null],
+    [t("info.bandwidth", "Bandwidth (measured by the server)"), statsNet ? (statsNet.kbps ? `${statsNet.kbps} kbit/s` : notMeasured) : null],
+    [t("info.session", "Session"), `${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, "0")}`],
+  ];
+  const tbl = $("infoTable"); tbl.textContent = "";
+  for (const [k, v] of rows) { if (v === null) continue; const tr = tbl.insertRow(); tr.insertCell().textContent = k; tr.insertCell().textContent = v; }
+  last = { t: now, rx: net.rx, tx: net.tx, video, codecs: last.codecsNext, stats };
+}
+setInterval(updateInfo, 1000);
+// In full screen the toolbar hides. It comes back when the mouse rests TB_DWELL ms at the top
+// edge right above it (a grip marks the spot), not anywhere along the edge: the corners belong
+// to the remote desktop (a maximized window's close button, menus). It hides again once the
+// mouse moves away from it; shown from the keyboard (Ctrl + Alt + Home), after 2.5 s.
+//
+// Chrome's own notice ("Press and hold Esc to exit full screen") sits at the top centre for a few
+// seconds when full screen starts and when the keyboard lock engages, right where the toolbar
+// shows: while it does (BROWSER_NOTICE_MS from either), the toolbar waits, then shows if still
+// asked for (the mouse still at the edge, or a show from the keyboard or a release). The reveal
+// stays at the top centre rather than a corner, for the reason above. The time is what 聪哥 saw
+// (about 5 s), not a number from Chrome: the browser says nothing when its notice goes.
+const TB_ZONE = 40, TB_DWELL = 300, TB_AWAY = 60, BROWSER_NOTICE_MS = 5000;
+let tbTimer = 0, tbAway = 0, tbDwell = 0, pointer = null, noticeUntil = 0, noticeTimer = 0;
+function browserNotice() { noticeUntil = Date.now() + BROWSER_NOTICE_MS; }
+const noticeLeft = () => (document.fullscreenElement ? Math.max(0, noticeUntil - Date.now()) : 0);
+const nearToolbar = (x, y) => { const r = toolbar.getBoundingClientRect();
+  return x >= r.left - TB_AWAY && x <= r.right + TB_AWAY && y <= r.bottom + TB_AWAY; };
+// A touch screen (an iPhone) has no mouse to rest at the top edge: the round button (ui.css #tbFab,
+// shown only there) shows the hidden toolbar and hides it again at a tap, and moves where a finger
+// drags it (kept in this browser, a convenience only). Its touches never reach the remote side.
+(() => {
+  const fab = $("tbFab"), KEY = "freerdp.tbFab";
+  let drag = null;
+  const place = (x, y) => {
+    const w = fab.offsetWidth || 44, h = fab.offsetHeight || 44;
+    fab.style.left = Math.min(Math.max(x, 0), innerWidth - w) + "px"; fab.style.top = Math.min(Math.max(y, 0), innerHeight - h) + "px";
+    fab.style.right = fab.style.bottom = "auto";
+  };
+  try { const p = JSON.parse(localStorage.getItem(KEY) || "null"); if (p && isFinite(p.x) && isFinite(p.y)) requestAnimationFrame(() => place(p.x, p.y)); } catch (e) { /* none kept */ }
+  fab.addEventListener("pointerdown", (e) => {
+    e.stopPropagation(); e.preventDefault();
+    const r = fab.getBoundingClientRect();
+    drag = { id: e.pointerId, x: e.clientX, y: e.clientY, left: r.left, top: r.top, moved: false };
+    try { fab.setPointerCapture(e.pointerId); } catch (err) { /* not capturable */ }
+  });
+  fab.addEventListener("pointermove", (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.hypot(dx, dy) > 8) drag.moved = true;
+    if (drag.moved) place(drag.left + dx, drag.top + dy);
+  });
+  const end = (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const moved = drag.moved; drag = null;
+    if (moved) { const r = fab.getBoundingClientRect(); try { localStorage.setItem(KEY, JSON.stringify({ x: r.left, y: r.top })); } catch (err) { /* not kept */ } }
+    else if (document.body.classList.contains("tbhide")) showToolbar(0);   // stays until the next tap
+    else hideToolbar();
+  };
+  fab.addEventListener("pointerup", end); fab.addEventListener("pointercancel", (e) => { if (drag && e.pointerId === drag.id) drag = null; });
+  fab.addEventListener("click", (e) => e.stopPropagation());
+})();
+// the toolbar hides at the top edge in full screen and in fill the window alike
+const edgeToolbar = () => document.body.classList.contains("fs") || document.body.classList.contains("fill");
+function hideToolbar() {
+  clearTimeout(tbTimer); clearTimeout(tbAway); tbTimer = tbAway = 0;
+  if (!edgeToolbar() || (pointer && nearToolbar(pointer.x, pointer.y))) return;
+  document.body.classList.add("tbhide");
+}
+function showToolbar(timeout = 2500) {
+  clearTimeout(noticeTimer); noticeTimer = 0;
+  const wait = noticeLeft();
+  if (wait) { noticeTimer = setTimeout(() => showToolbar(timeout), wait); return; }
+  document.body.classList.remove("tbhide");
+  clearTimeout(tbTimer); tbTimer = timeout ? setTimeout(hideToolbar, timeout) : 0;
+}
+// a mouse only: a tap on a touch screen also makes an emulated mousemove, which would take the
+// toolbar the round button just showed for a pointer that left it (pointer events say which it is)
+window.addEventListener("pointermove", (e) => {
+  if (e.pointerType !== "mouse" || !edgeToolbar() || document.pointerLockElement) return;
+  pointer = { x: e.clientX, y: e.clientY };
+  if (!document.body.classList.contains("tbhide")) {
+    if (nearToolbar(e.clientX, e.clientY)) { clearTimeout(tbTimer); clearTimeout(tbAway); tbTimer = tbAway = 0; }
+    else if (!tbAway) tbAway = setTimeout(hideToolbar, 600);
+    return;
+  }
+  const r = toolbar.getBoundingClientRect();
+  if (e.clientY <= 4 && Math.abs(e.clientX - (r.left + r.right) / 2) <= r.width / 2 + TB_ZONE) {
+    if (!tbDwell) tbDwell = setTimeout(() => { tbDwell = 0; showToolbar(0); }, Math.max(TB_DWELL, noticeLeft()));
+  } else { clearTimeout(tbDwell); tbDwell = 0; }
+}, true);
+// in a window: keep the toolbar at the top of the canvas
+const placeToolbar = () => document.documentElement.style.setProperty("--tbtop", Math.max(0, $("canvas").getBoundingClientRect().top) + "px");
+window.addEventListener("resize", placeToolbar); window.addEventListener("scroll", placeToolbar);
+
+// the canvas height is "viewport minus header": keep --hdr in sync with the header's height
+const syncHeader = () => document.documentElement.style.setProperty("--hdr", document.querySelector("header").offsetHeight + "px");   // 0 when hidden
+window.addEventListener("resize", syncHeader); syncHeader();
+
+let audioContext = null;
+// again: a reconnection with the password kept in memory (no passkey, no typing)
+const noPassword = { asked: false };   // Connect stopped once for an empty password (connect, below)
+async function connect(againPassword = null, retrying = false) {
+  if (connectStarted || runtimeFailed) return;
+  try { HostsUI.check(); } catch (e) { status(e.message); return; }
+  if (!storeFields()) { status("Fix the host's settings first.", "status.fixHost"); return; }
+  const selectedId = HostsUI.selected;
+  const checkSelection = () => {
+    if (HostsUI.selected !== selectedId) throw new Error(t("status.hostChanged", "Selected host changed. Connect again to use the current selection."));
+    HostsUI.check();
+  };
+  connectStarted = true;
+  let handedToWasm = false;
+  try {
+  if (!runtimeReady) status("waiting for runtime…", "status.waiting");
+  // Audio: browsers only start an AudioContext from a user gesture, so create it here, before
+  // any await; FreeRDP's Web Audio backend (rdpsnd "emscripten") plays through it.
+  try {
+    audioContext ??= new AudioContext({ latencyHint: "interactive" });
+    audioContext.resume().catch(() => {});
+    Module.freerdpAudioContext = audioContext;
+  } catch (e) { log("[page] no Web Audio: " + e.message); }
+  if (againPassword === null) await HostsUI.prepare();   // the vault's passkey, if this host's password is there
+  checkSelection();
+  if (!await runtime) throw new Error(t("status.noRuntime", "WebAssembly runtime unavailable."));
+  checkSelection();
+  if ($("fs").checked) { if (filling || fillByDefault()) setFill(true); else await enterFullscreen(); }
+  // SDL3 applies FreeRDP's windowed state with document.exitFullscreen(); the page owns full
+  // screen, so ignore programmatic exits (toggleFullscreen and holding Esc still work).
+  document.exitFullscreen = () => Promise.resolve();   // likewise for SDL leaving full screen
+  // switch to the session layout first (header hidden), let it settle, then measure: the first
+  // picture then has exactly the canvas aspect ratio; /dynamic-resolution follows later resizes
+  document.body.classList.add("session"); syncHeader();
+  filesToolbar();
+  filesState.offered = filesState.session = null; filesHide();   // a new session knows nothing of them
+  // two frames, or 200 ms: a hidden tab, or one that lost focus to a passkey prompt, may get no
+  // frames for a while (the measurement below forces the layout either way)
+  await Promise.race([new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))),
+    new Promise((r) => setTimeout(r, 200))]);
+  // macOS animates into full screen: the window grows for most of a second after the request.
+  // Measured then, the session started a little smaller than the screen ("2560 x 1520" on a
+  // 2880 x 1800 one) and was resized right after. Wait until the size holds still for 150 ms
+  // (at most 1.5 s).
+  if (document.fullscreenElement) {
+    const size = () => innerWidth + "x" + innerHeight;
+    for (let last = size(), still = 0, t = 0; still < 150 && t < 1500; t += 50) {
+      await new Promise((r) => setTimeout(r, 50));
+      if (size() === last) still += 50; else { last = size(); still = 0; }
+    }
+  }
+  const r = $("canvas").getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const even = (v) => Math.max(2, Math.round(v * dpr / 2) * 2);
+  const size = `${even(r.width)}x${even(r.height)}`, scale = Math.round(dpr * 100);
+  checkSelection();
+  HostsUI.use(againPassword, host => {
+    if (host.direct && !window.directSocketsAvailable) throw new Error(t("status.needsDirect", "This saved host needs Direct TCP. Install and open the isolated app."));
+    // No password: FreeRDP sends an empty one, a server that wants one hangs up after the TLS
+    // handshake, and the Log says "ERRINFO_RPC_INITIATED_DISCONNECT" (an administrative tool?),
+    // which reads as anything but a password (聪哥 in Firefox, 2026-11-15: his saved host and
+    // password live in Chrome's storage). Connect asks for it first; Connect again with the field
+    // still empty goes without one (a server with its own logon screen, an account without one).
+    if (againPassword === null && !host.password && !noPassword.asked) {
+      noPassword.asked = true;
+      throw Object.assign(new Error(t("status.passwordFirst", "Enter the password first. Connect again to go without one.")), { focus: "pass" });
+    }
+    noPassword.asked = false;
+    const session = readSession();
+    const route = gatewayRoute(host.host, host.direct);
+    if (!host.direct) Module.websocket.url = route.url ?? (route.secure ? "wss://" : "ws://");
+    const resolved = { ...host, host: route.host, extra: FreeRDPOptions.resolve(session, host.extra, codecEnv()).join(" ") };
+    let args;
+    try { args = FreeRDPVault.connectionArgs(resolved, size, scale); } finally { resolved.password = ""; }
+    clipboardOn = !args.some((a) => /^-clipboard$|^[/+]clipboard:(?:off|false)$/i.test(a));
+    if (host.direct) {
+      window.useDirectTcp(); log("[page] direct TCP via Direct Sockets (IWA), no gateway");
+    } else if (!window.WebSocket.counted) {
+      const Base = window.WebSocket;
+      window.WebSocket = class extends Base {
+        static counted = true;
+        constructor(url, protocols) {
+          super(url, protocols);
+          this.addEventListener("open", () => { conn.opened = true; });
+          const hop = mixedBlocked(String(url));
+          if (hop && !conn.mixed) { conn.mixed = hop; log(`[page] this browser does not let an https page open ws://${hop} (mixed content): the gateway cannot be reached from here`); }
+        }
+        send(d) { window.freerdpNet.tx += d.byteLength ?? d.length ?? 0; super.send(d); }
+        set onmessage(fn) { super.onmessage = e => { window.freerdpNet.rx += e.data.byteLength ?? 0; fn(e); }; }
+        get onmessage() { return super.onmessage; }
+      };
+    }
+    trackSockets();
+    sessionPassword = host.password;
+    if (modularClient()) again.keep(selectedId, host.password);
+    info.started = Date.now(); info.server = host.host;
+    { const n = window.freerdpNet || { rx: 0, tx: 0 }; info.netBase = { rx: n.rx, tx: n.tx }; }
+    info.transport = host.direct ? t("info.direct", "direct TCP (IWA)") : t("info.gateway", "WebSocket gateway");
+    $("go").disabled = true; status("connecting…", "status.connecting");
+    log("[page] sdl-freerdp " + args.map(a => a.startsWith("/p:") ? "/p:***" : a.startsWith("/u:") ? "/u:***" : a).join(" "));
+    $("pass").value = "";
+    placeToolbar();
+    // the page's own retry leaves someone reading the Log alone: a drop is when it matters most
+    if (!retrying || logView.following) { $("logPanel").open = false; $("canvas").focus(); }
+    crash.running = true; crash.userEnded = false; crashStore("running"); connLog.length = 0; conn.began = Date.now(); conn.paints = codecReading(); conn.refused = false; conn.mixed = null; conn.opened = false;
+    crash.timer = setInterval(() => crashStore("running"), 5000);
+    // callMain is one-shot. FreeRDP copies argv into its runtime settings; JS drops its copies.
+    handedToWasm = true;
+    try { writeHotkeys(); } catch (e) { log("[page] hotkeys not written, FreeRDP's defaults apply: " + e); }
+    try { Module.callMain(args); }
+    catch (e) { if (e !== "unwind") log("[page] " + e); }
+    finally { args.fill(""); sessionPassword = ""; HostsUI.lock(); }
+  });
+  } catch (e) {
+    status(e.message);
+    if (againPassword === null) { document.body.classList.remove("session"); syncHeader(); }
+    if (!handedToWasm) { connectStarted = false; $("go").disabled = !runtimeReady; }
+    if (e.focus) setTimeout(() => $(e.focus)?.focus(), 0);   // the field to fill in, once the form is back
+    if (againPassword !== null) showEnd(t("end.notAgain", "Not reconnected: " + e.message, { why: e.message }), true);
+  }
+}
+
+window.addEventListener("pagehide", () => again.forget());
+// The client's sockets (gateway WebSocket or Direct TCP), closed by Reconnect while a session runs.
+// A connection that dies without closing (a hung ssh tunnel, a network that changed: no FIN, #369)
+// is noticed by nobody: a WebSocket has no keepalive, FreeRDP no read watchdog. Two things here:
+//  - close(): FreeRDP's socket layer (Emscripten's SOCKFS) waits for the close event, and Chrome
+//    sends it only when its closing handshake gives up, 60 s later (code 1006). So a gateway socket
+//    the page closes gets its close event at once (code 4000), and the browser's late one is
+//    dropped: Reconnect on a dead connection took 76 s, now 20 s (the GNOME test bed, 2026-11-13).
+//  - the watchdog (deadWatch, below) closes a socket the server has gone quiet on.
+// Direct TCP (tcp-shim.js, the installed app) is no EventTarget; its close() ends its own reads.
+const sockets = new Set();
+function trackSockets() {
+  const Base = window.WebSocket;
+  if (Base.tracked) return;
+  const events = typeof EventTarget === "function" && Base.prototype instanceof EventTarget;
+  window.WebSocket = class extends Base {
+    static tracked = true;
+    constructor(...a) {
+      super(...a); sockets.add(this);
+      this.lastMessage = Date.now(); this.messages = 0; this.closeSent = false;
+      if (!events) return;
+      this.addEventListener("message", () => { this.lastMessage = Date.now(); this.messages++; });
+      // before SOCKFS's onclose: a capture listener at the target runs first
+      this.addEventListener("close", (e) => {
+        if (this.closeSent && !e.byPage) e.stopImmediatePropagation();   // the browser's, a minute late
+        this.closeSent = true; sockets.delete(this);
+      }, { capture: true });
+    }
+    close(...a) {
+      try { super.close(...a); } finally {
+        if (events && !this.closeSent) {
+          const e = new CloseEvent("close", { code: 4000, reason: "closed by the page", wasClean: false });
+          e.byPage = true; this.dispatchEvent(e);
+        }
+      }
+    }
+  };
+}
+// The watchdog (dead-watch.js): a server that kept talking and then stopped is gone, so the page
+// closes its socket and FreeRDP reconnects by itself (shadow on GNOME, hung: closed after 10 s, the
+// desktop answering again within 20 s, no click); a server that is silent when idle (xrdp: not one
+// message in 180 s) never arms it, unless it played sound. Gateway WebSockets only.
+const deadWatch = { socket: null, watch: null, input: 0 };
+for (const type of ["keydown", "pointerdown", "pointermove", "wheel"])
+  window.addEventListener(type, () => { deadWatch.input = Date.now(); }, { capture: true, passive: true });
+function deadTick() {
+  const s = [...sockets].filter((x) => x.readyState === 1 && typeof x.addEventListener === "function").pop();
+  if (!crash.running || !s || !window.freerdpDeadWatch) { deadWatch.socket = null; return; }
+  if (deadWatch.socket !== s) Object.assign(deadWatch, { socket: s, watch: window.freerdpDeadWatch.create() });
+  const codecs = codecReading();
+  const dead = deadWatch.watch.tick({ now: Date.now(), messages: s.messages, lastMessage: s.lastMessage,
+    paints: codecs ? window.freerdpCodecStats.paints(codecs) : null, input: deadWatch.input });
+  if (!dead) return;
+  log(`[page] no message from the server for ${Math.round(dead.silentMs / 1000)} s (it talked about every ${Math.round(dead.paceMs / 1000)} s): the connection is dead, closing it`);
+  deadWatch.socket = null;
+  droppedNow();
+  try { s.close(); } catch (e) { /* closed */ }
+}
+setInterval(deadTick, 1000);
+// FreeRDP itself retries a dropped network (+auto-reconnect, vault.js) within the same client;
+// when that client gives up and ends, the page starts a new one: after 2, 4, 8… s, up to 8 times
+const retry = { count: 0, timer: 0, max: 8 };
+// A server that checks the password after the connection sequence (FreeRDP's shadow server, over
+// TLS) cannot say why: FreeRDP's clients don't announce Set Error Info, so a wrong password only
+// shows as this disconnect, and exit code 131 would read as a drop. What tells it from a drop is
+// that the connection never showed anything, soon after it began. A first start of a session
+// that takes long is no such case: there the connection stays open. Counters cover graphics
+// (RDPGFX) only, so a session without them is judged by nothing but the clock: after this long
+// it was a session, and the normal end applies.
+const HUNG_UP = /ERRINFO_RPC_INITIATED_DISCONNECT/, HUNG_UP_MS = 60000;
+const conn = { began: 0, paints: null, mixed: null, opened: false };
+// An https page may not open a plain ws:// socket (mixed content). Chrome, Edge and Firefox make
+// an exception for the loopback (127.0.0.1, localhost, [::1]), where the SSH tunnel puts the
+// gateway; Safari makes none, and every browser on iPhone and iPad is Safari underneath (WebKit).
+// It blocks the socket before anything leaves, says so only in its own console ("requested
+// insecure content from ws://127.0.0.1:3390/. This content was blocked"), and FreeRDP logs
+// "Connection refused": it looked as if 127.0.0.1 were refused (聪哥, 2026-11-15). The page says
+// what happened instead: the host and port of the blocked socket, or null.
+const webkitEngine = () => /AppleWebKit\//.test(navigator.userAgent) && !/Chrome\/|Chromium\/|Firefox\//.test(navigator.userAgent);
+const loopbackHost = (h) => /^(127\.\d+\.\d+\.\d+|localhost|\[::1\])$/i.test(h);
+// The gateway's WebSocket: wss:// when the address says so, or when this page is https and the gateway
+// is on another computer (a plain ws:// to it is blocked there in every browser: mixed content); else
+// ws://. A wss:// gateway needs a certificate the browser trusts for its name (Let's Encrypt), and is
+// the one way in from an iPhone (聪哥, 2026-11-15: freerdp.congzhang.li). Its port is 443 unless given.
+// WASM PoC local workaround: on the "wasm" branch the gateway may be given as a
+// full ws(s):// URL with a path (e.g. wss://host:443/ws). That full URL is passed
+// verbatim to Emscripten's socket layer, so both the fake-DNS table bug
+// (emscripten#27886, PROXY_TO_PTHREAD + gethostbyname) and the /ws path mismatch
+// are bypassed. Plain host:port or scheme-only values keep the original path.
+// Returns FreeRDP's /v: (host:port, no scheme), whether the socket is wss://,
+// and optionally the full WebSocket URL for createPeer.
+function gatewayRoute(address, direct = false) {
+  const a = String(address).trim();
+  if (direct) return { host: a, secure: false };
+  const m = /^(wss?):\/\/([^/?#]+)(\/[^?#]*)?$/i.exec(a);
+  const hop = m ? m[2] : a, name = hop.replace(/:\d+$/, "");
+  const secure = m ? m[1].toLowerCase() === "wss" : location.protocol === "https:" && !loopbackHost(name);
+  const host = secure && !/:\d+$/.test(hop) ? hop + ":443" : hop;
+  const url = m && m[3] ? `${m[1].toLowerCase()}://${m[2]}${m[3]}` : undefined;
+  return { host, secure, url };
+}
+// the same page from the gateway itself (websockify --web serves it on the gateway's port), over
+// http: a page on 127.0.0.1 may open ws://127.0.0.1 in Safari too. The address and the settings
+// in this page's address go along (never a password: loadSettings keeps none in it)
+// It goes by the name localhost, not 127.0.0.1: a passkey belongs to a site name, and WebAuthn takes
+// no IP address for one, so the vault would not work there (聪哥, 2026-11-15)
+const localName = (hop) => hop.replace(/^(127\.\d+\.\d+\.\d+|\[::1\])(?=:\d+$|$)/, "localhost");
+function localPage(hop) {
+  const u = new URL(`http://${localName(hop)}/index.html`), q = new URLSearchParams(location.search);
+  q.delete("p"); q.set("v", hop); u.search = q.toString(); return u.href;
+}
+function mixedBlocked(url) {
+  const m = location.protocol === "https:" && /^ws:\/\/((\[[^\]]+\]|[^:/]+)(:\d+)?)/i.exec(url);
+  return m && (webkitEngine() || !loopbackHost(m[2])) ? m[1] : null;
+}
+const codecReading = () => { const cs = window.freerdpCodecStats;
+  return cs && typeof Module._freerdp_web_codec_stats === "function" ? cs.read(Module.HEAPU8, Module._freerdp_web_codec_stats()) : null; };
+// the server ended this connection before it showed anything: the password, most likely
+const refusedBeforePicture = () => connLog.some((l) => HUNG_UP.test(l)) && Date.now() - conn.began < HUNG_UP_MS &&
+  window.freerdpCodecStats?.paintedNothing(conn.paints, codecReading()) === true;
+const LOGON_FAILED = /ERRCONNECT_(LOGON_FAILURE|WRONG_PASSWORD|ACCESS_DENIED|ACCOUNT_\w+|PASSWORD_\w+|NO_OR_MISSING_CREDENTIALS)|credentials do not work/;
+function showEnd(text, canReconnect, local = null) {
+  $("endText").textContent = text;
+  $("endLocal").hidden = !local; if (local) $("endLocal").href = local;
+  $("endReconnect").hidden = !canReconnect;
+  $("endReconnect").textContent = modularClient() && again.has(HostsUI.selected) ? t("tb.reconnect", "Reconnect") : t("end.reload", "Reload and connect");
+  $("endBar").hidden = false;
+}
+function sessionEnded(unexpected, why = "") {
+  dropOver();
+  if (modularClient()) connectStarted = false;   // an older client runs once
+  if (crash.userEnded) { endCapture(); return; }
+  if (modularClient()) newClient();   // ready for Reconnect, while the bar says what happened
+  if (conn.mixed && !conn.opened) {   // the browser blocked the gateway's socket: trying again changes nothing
+    again.forget(); retry.count = 0; endCapture();
+    const local = loopbackHost(conn.mixed.replace(/:\d+$/, ""));
+    showEnd(local
+      ? t("end.mixedLocal", `Safari does not let this https page reach the gateway at ${conn.mixed}: an https page may not open a plain ws:// connection, and Safari, unlike Chrome, Edge and Firefox, makes no exception for 127.0.0.1. A gateway that serves this page too (websockify --web) opens it at http://${localName(conn.mixed)}/, where Safari connects (its saved hosts are its own). Or use Chrome, Edge or Firefox.`, { hop: conn.mixed, local: localName(conn.mixed) })
+      : t("end.mixedRemote", `This https page may not open a plain ws:// connection to ${conn.mixed}, in any browser. Reach the gateway through the SSH tunnel at 127.0.0.1 (the safety notice has the command).`, { hop: conn.mixed }), false,
+      local ? localPage(conn.mixed) : null);
+    return;
+  }
+  const passwordRefused = connLog.some((l) => LOGON_FAILED.test(l));
+  if (passwordRefused || conn.refused) {
+    again.forget(); retry.count = 0; endCapture();
+    showEnd(passwordRefused ? t("end.refused", "The server refused the password. Connect again with the right one.")
+      : t("end.noPicture", "The server ended the connection before showing anything. Check the user name and password, and connect again."), false);
+    return;
+  }
+  const canAgain = modularClient() && again.has(HostsUI.selected);
+  if (unexpected && canAgain && retry.count < retry.max) {
+    const wait = Math.min(30, 2 ** ++retry.count);
+    showEnd(t("end.retry", `Connection lost. Reconnecting in ${wait} s (try ${retry.count} of ${retry.max})…`, { wait, n: retry.count, max: retry.max }), true);
+    retry.timer = setTimeout(() => reconnect(true), wait * 1000);
+    return;
+  }
+  endCapture();
+  showEnd(unexpected ? t("end.lost", "Connection lost.") : why ? t("end.endedWhy", `The session ended: ${why.text}.`, { why: said(why) })
+    : t("end.ended", "The session ended."), true);
+}
+async function reconnect(automatic = false) {
+  clearTimeout(retry.timer);
+  if (!automatic) retry.count = 0;
+  if (!modularClient() || !again.has(HostsUI.selected)) { again.forget(); location.reload(); return; }
+  log("[page] reconnect" + (automatic ? ` (try ${retry.count})` : ""));
+  // a session that still runs, e.g. a network that hangs instead of failing: close its sockets;
+  // FreeRDP reconnects by itself, or ends and comes back here
+  if (crash.running) {
+    droppedNow();   // the bar, not a picture that looks alive (#369)
+    for (const s of sockets) try { s.close(); } catch (e) { /* closed */ }
+    sockets.clear(); return;
+  }
+  $("endText").textContent = t("end.reconnecting", "Reconnecting…"); $("endReconnect").hidden = true;
+  const password = await again.take(HostsUI.selected);
+  await connect(password ?? "", automatic);
+  if (crash.running) { $("endBar").hidden = true; }
+}
+$("endReconnect").onclick = () => reconnect();
+$("endClose").onclick = () => { clearTimeout(retry.timer); again.forget(); location.reload(); };
+// a session that came back (FreeRDP's own reconnect, or a new client) resets the count
+const drop = { timer: 0 };
+const dropOver = () => { clearInterval(drop.timer); drop.timer = 0; };
+const reconnected = () => { dropOver(); retry.count = 0; $("endBar").hidden = true; };
+// the picture coming back is what ends a drop (FreeRDP says nothing when its reconnect works);
+// a client without the counters keeps the bar until its next log line says so
+function droppedNow() {
+  showEnd(t("end.reconnecting", "Reconnecting…"), false);
+  if (drop.timer) return;
+  const cs = window.freerdpCodecStats, before = codecReading();
+  if (!cs || !before) return;
+  drop.timer = setInterval(() => {
+    const now = crash.running ? codecReading() : null;
+    if (!now) { dropOver(); return; }
+    if (!cs.paintedNothing(before, now)) reconnected();
+  }, 500);
+}
+
+// The last session's log, in the Log's own tab. Only an unexpected end is announced: copy, or show.
+(() => {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(CRASH_KEY) || "null"); } catch (e) {}
+  if (!saved || !saved.lines?.length) return;
+  const when = new Date(saved.time).toLocaleString();
+  const keep = (head) => { $("logLast").textContent = head + "\n" + saved.lines.join("\n") + "\n"; $("logLastTab").hidden = false; };
+  if (saved.state === "clean") { keep(`FreeRDP Web: last session, ended ${when}`); return; }
+  const why = saved.reason || (saved.state === "running" ? "the page was closed, reloaded or crashed during the session" : "unknown");
+  // the log keeps the English reason; the notice says it in the visitor's language
+  const whyText = saved.reason || (saved.state === "running" ? t("lastlog.closed", why) : t("lastlog.unknown", why));
+  $("lastlogText").textContent = t("lastlog.text", `The last session ended unexpectedly (${why}, ${when}). Its log is saved in this browser.`, { why: whyText, when });
+  $("lastlog").hidden = false;
+  const text = `FreeRDP Web: last session ended unexpectedly (${why}, ${when})\n` + saved.lines.join("\n");
+  keep(`FreeRDP Web: last session ended unexpectedly (${why}, ${when})`);
+  const show = () => { $("logPanel").open = true; showLastLog(true); };
+  $("lastlogCopy").onclick = () => navigator.clipboard.writeText(text).then(
+    () => { $("lastlogCopy").textContent = t("copied", "Copied"); }, () => { show(); $("lastlogCopy").textContent = t("lastlog.shown", "Shown below"); });
+  $("lastlogShow").onclick = show;
+  $("lastlogDismiss").onclick = () => { try { localStorage.removeItem(CRASH_KEY); } catch (e) {} $("lastlog").hidden = true; };
+})();
+// a submitted form is what tells the browser's password manager to offer saving the password
+$("connectForm").addEventListener("submit", (e) => { e.preventDefault(); connect(); });
+
+// The words the page sets itself, again in the visitor's language once it changes (i18n.js has
+// already put the HTML's own words in it). Lines that come and go (the end bar, the toasts) keep
+// the language they were said in.
+let goReady = false, micReady = false;
+function showGo() { $("go").textContent = goReady ? t("form.connect", "Connect") : t("form.loading", "Loading…"); }
+function showMicTitle() {
+  $("optMic").parentElement.title = micReady ? t("set.micTitle", "Send this browser's microphone to the remote session (the browser asks first)")
+    : t("set.micNone", "This build of the client has no microphone support");
+}
+function showFsButton() { $("tbFs").textContent = document.fullscreenElement || filling ? t("tb.window", "Window") : t("tb.fullscreen", "Full screen"); }
+globalThis.FreeRDPi18n?.onChange(() => {
+  showTargetLabel(); showGo(); showMicTitle(); showFsButton(); showPinTitle(); showScreensButton(); showDirectHint(); showLogView();
+  updateSessionText(); showHotkeys(); updateRoute(); status(...statusLine);
+});
+
+// Input diagnostics, OFF by default because keys typed into the remote side can be passwords.
+// Enable with ?debugkeys=1; even then only the physical key position is logged, never the
+// character, and only for the first few events.
+const debugKeys = new URLSearchParams(location.search).get("debugkeys") === "1";
+let keyLogs = 0, mouseLogs = 0;
+if (debugKeys) {
+  window.addEventListener("keydown", (e) => {
+    if (!$("go").disabled || keyLogs >= 8) return;
+    keyLogs++;
+    const named = e.key.length > 1 ? e.key : "(character)";   // "Shift", "Enter", "Process"...
+    log(`[input] keydown ${named} keyCode=${e.keyCode} composing=${e.isComposing} target=${e.target.tagName}${e.target.id ? "#" + e.target.id : ""}`);
+  }, true);
+  window.addEventListener("mousedown", (e) => {
+    if (!$("go").disabled || mouseLogs >= 3) return;
+    mouseLogs++;
+    log(`[input] mousedown button=${e.button} at ${e.clientX},${e.clientY} target=${e.target.tagName}${e.target.id ? "#" + e.target.id : ""}`);
+  }, true);
+}
+fetch(".well-known/manifest.webmanifest").then((r) => r.json()).then((m) => log(`[page] FreeRDP Web ${m.version}`)).catch(() => {});
+if (!crossOriginIsolated) log("[page] warning: not cross-origin isolated, threads will not work (serve with COOP/COEP)");
