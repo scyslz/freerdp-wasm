@@ -1,0 +1,28 @@
+freerdp-wasm
+Copyright 2026 scyslz
+
+This repository contains a Go proxy and an embedded copy of the upstream
+FreeRDP WASM web client. The client is redistributed under the terms of its
+respective upstream licenses.
+
+Embedded client (proxy/site/)
+-----------------------------
+Source:    https://github.com/congzhangzh/freerdp-web (Apache-2.0)
+           commit 42e8495371acdd020c10a2f64bb25179c006caf4
+Binary:    https://github.com/congzhangzh/rdp-release-kit
+           release web-20261126.1-b8390ae2807a (freerdp-web-page.zip)
+License:   Apache License 2.0 — see proxy/site/LICENSE.upstream
+Details:   proxy/site/MANIFEST lists all third-party components and their
+           pinned source revisions; their licenses are in proxy/site/licenses/.
+
+Modifications
+-------------
+proxy/site/app.js was patched locally to support a full ws(s)://.../ws gateway
+URL (workaround for Emscripten issue #27886 in the prebuilt multi-threaded
+client). The unmodified upstream file is kept as proxy/site/app.js.orig for
+reference. The patch is also reproducible via scripts/fetch-client.sh +
+a small sed (see README).
+
+Go proxy (proxy/main.go, scripts/)
+----------------------------------
+Copyright 2026 scyslz. Licensed under Apache-2.0 (see LICENSE in this repo root).
