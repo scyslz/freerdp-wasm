@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Build the single-file freerdp-wasm binary (Go + embedded WASM client).
+# The WASM binaries are fetched from upstream on demand; all other frontend
+# assets (including our app.js gateway patch) are tracked in this repository.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,8 +12,13 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -f "$ROOT/proxy/site/index.html" ]]; then
-  echo "[freerdp-wasm] embedded site missing: proxy/site/ (run scripts/fetch-client.sh first)" >&2
+# Fetch the prebuilt WASM binaries if they are not present locally.
+if [[ "${SKIP_WASM_FETCH:-0}" != "1" ]]; then
+  "$ROOT/scripts/fetch-wasm.sh"
+fi
+
+if [[ ! -s "$ROOT/proxy/site/sdl-freerdp.wasm" ]]; then
+  echo "[freerdp-wasm] missing proxy/site/sdl-freerdp.wasm (set SKIP_WASM_FETCH=0 or run scripts/fetch-wasm.sh)" >&2
   exit 1
 fi
 

@@ -36,15 +36,19 @@ subprotocol and pipes the frames straight to TCP.
 > a VPN / SSH tunnel rather than opening the port. The proxy itself does not
 > authenticate callers and `CheckOrigin` is permissive by design.
 
-1. Fetch the prebuilt WASM client (no Emscripten toolchain needed):
+1. Build the single-file binary (no Emscripten toolchain needed):
 
    ```bash
-   ./scripts/fetch-client.sh   # only needed to refresh the embedded client
    ./build.sh                   # -> dist-release/wsproxy
    ```
 
+   `build.sh` automatically fetches the two prebuilt `.wasm` binaries from the
+   upstream release kit if they are missing (cached under `~/.cache/freerdp-web-poc`,
+   SHA-256 verified). All other frontend assets — including our patched `app.js`
+   — are tracked in this repository, so only the compiled WASM is downloaded.
+
    The script downloads the release kit's `freerdp-web-page.zip` with `curl`
-   (retries + resume), verifies its SHA-256, and unpacks it into `dist/site/`.
+   (retries + resume), verifies its SHA-256, and unpacks it into `proxy/site/`.
    The kit tag is resolved from GitHub's releases API via `curl` (streamed to a
    file, so the flaky `urllib` chunked-read that broke upstream `site.sh` is
    avoided). Downloads are cached in `~/.cache/freerdp-web-poc` (override with
@@ -56,7 +60,7 @@ subprotocol and pipes the frames straight to TCP.
    | --- | --- |
    | `KIT_TAG=web-20261126.1-b8390ae2807a` | Pin a specific kit pre-release (skips API tag resolution) |
    | `SITE_ZIP_URL=... SITE_ZIP_SHA_URL=...` | Use a manually hosted zip + checksum (fully offline) |
-   | `FORCE_FETCH=1` | Re-resolve the newest kit even if `dist/site` already exists |
+   | `KIT_TAG=<tag>` | Pin a specific upstream kit release when fetching WASM |
    | `SITE_DIR=...` | Install into a different directory |
    | `CACHE=...` | Change the download cache location |
 
@@ -77,11 +81,10 @@ subprotocol and pipes the frames straight to TCP.
    bind loopback only.
 
    The WASM client is **embedded into the binary** via `go:embed`, so `wsproxy`
-   is a single ~30 MB static file — no `dist/site/` directory needed at
-   runtime. A disk `dist/site/` directory is used in preference when present,
+   is a single ~30 MB static file — no `proxy/site/` directory needed at
+   runtime. A disk `proxy/site/` directory is used in preference when present,
    so you can hot-reload the frontend without rebuilding; delete/rename it to
-   fall back to the embedded copy. `fetch-client.sh` syncs downloaded clients
-   into `proxy/site/` automatically for embedded builds.
+   fall back to the embedded copy.
 
    If RDS is not reachable from your workstation, run the binary on a jump host
    that can reach TCP 3389 and forward the port to your local machine. The
@@ -109,8 +112,8 @@ subprotocol and pipes the frames straight to TCP.
    ```
 
    The page passes this URL verbatim to the WASM client's WebSocket layer.
-   This is a local workaround in `dist/site/app.js` (patched after unpacking
-   the release kit; the original is saved as `dist/site/app.js.orig`) for a
+   This is a local workaround in `proxy/site/app.js` (the unmodified upstream
+   copy is saved as `proxy/site/app.js.orig`) for a
    known Emscripten bug in the prebuilt kit
    ([emscripten#27886](https://github.com/emscripten-core/emscripten/issues/27886)):
    under `PROXY_TO_PTHREAD`, `gethostbyname()` writes its fake DNS entry into
@@ -145,7 +148,8 @@ subprotocol and pipes the frames straight to TCP.
 
 ## Files
 
-- `scripts/fetch-client.sh` - pulls upstream prebuilt release kit into `dist/site/` (curl-first, cached, SHA-256 verified; git+site.sh fallback)
+- `scripts/fetch-wasm.sh` - downloads only the two prebuilt `.wasm` binaries from the upstream release kit (curl-first, cached, SHA-256 verified)
+- `scripts/fetch-client.sh` - legacy full-kit fetcher (all assets); kept for refreshing the whole frontend
 - `proxy/main.go` - single Go binary: static server + WS↔TCP proxy (stdlib + gorilla/websocket), negotiating websockify's `binary` subprotocol
 - `proxy/Dockerfile` - builds a `FROM scratch` static binary and runs it
 - `scripts/run-poc.sh` - builds the binary (go or docker fallback) and runs it

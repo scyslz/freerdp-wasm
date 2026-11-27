@@ -8,3 +8,7 @@
 *.swp
 .DS_Store
 __pycache__/
+
+# Prebuilt WASM binaries fetched from upstream at build time (not source)
+proxy/site/*.wasm
+proxy/site/jspi/*.wasm

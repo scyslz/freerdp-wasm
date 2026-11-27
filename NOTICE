@@ -10,7 +10,10 @@ Embedded client (proxy/site/)
 Source:    https://github.com/congzhangzh/freerdp-web (Apache-2.0)
            commit 42e8495371acdd020c10a2f64bb25179c006caf4
 Binary:    https://github.com/congzhangzh/rdp-release-kit
-           release web-20261126.1-b8390ae2807a (freerdp-web-page.zip)
+           release web-20261126.1-b8390ae2807a (freerdp-web-page.zip).
+           The two compiled .wasm files are NOT stored in git; they are fetched
+           from this release by scripts/fetch-wasm.sh at build time (SHA-256
+           verified). All other site assets are tracked here.
 License:   Apache License 2.0 — see proxy/site/LICENSE.upstream
 Details:   proxy/site/MANIFEST lists all third-party components and their
            pinned source revisions; their licenses are in proxy/site/licenses/.
