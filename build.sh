@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the single-file freerdp-wasm binary (Go + embedded WASM client).
-# The WASM binaries are fetched from upstream on demand; all other frontend
-# assets (including our app.js gateway patch) are tracked in this repository.
+# Build the single-file freerdp-wasm binary.
+# Every build: fetch the latest upstream frontend, re-apply our app.js patch,
+# then compile the Go proxy with the frontend embedded.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,16 +12,21 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
-# Fetch the prebuilt WASM binaries if they are not present locally.
-if [[ "${SKIP_WASM_FETCH:-0}" != "1" ]]; then
-  "$ROOT/scripts/fetch-wasm.sh"
+# 1. Fetch the newest upstream client into proxy/site/ (SHA-256 verified).
+#    Set REUSE_SITE=1 to keep the current copy, or KIT_TAG=<tag> to pin.
+if [[ "${SKIP_FETCH:-0}" != "1" ]]; then
+  "$ROOT/scripts/fetch-client.sh"
 fi
 
+# 2. Re-apply our WSS gateway workaround (idempotent; fails if upstream changed).
+"$ROOT/scripts/patch-client.sh"
+
 if [[ ! -s "$ROOT/proxy/site/sdl-freerdp.wasm" ]]; then
-  echo "[freerdp-wasm] missing proxy/site/sdl-freerdp.wasm (set SKIP_WASM_FETCH=0 or run scripts/fetch-wasm.sh)" >&2
+  echo "[freerdp-wasm] missing proxy/site/sdl-freerdp.wasm" >&2
   exit 1
 fi
 
+# 3. Compile the single-file binary.
 mkdir -p "$(dirname "$OUT")"
 echo "[freerdp-wasm] building $(go version) -> $OUT"
 (cd "$ROOT/proxy" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$OUT" .)

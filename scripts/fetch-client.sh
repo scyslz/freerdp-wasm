@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch the prebuilt WASM FreeRDP client release kit into ./dist/site.
+# Fetch the latest prebuilt WASM FreeRDP client release kit into ./proxy/site.
 # No Emscripten toolchain needed -- we consume upstream prebuilt artifacts.
 #
 # The upstream site.sh uses python urllib to page through the GitHub releases
@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="${REPO:-congzhangzh/freerdp-web}"
 KIT="${KIT:-congzhangzh/rdp-release-kit}"
 TAG="${TAG:-latest}"
-SITE_DIR="${SITE_DIR:-$ROOT/dist/site}"
+SITE_DIR="${SITE_DIR:-$ROOT/proxy/site}"
 CACHE="${CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/freerdp-web-poc}"
 
 mkdir -p "$SITE_DIR" "$CACHE"
@@ -125,17 +125,15 @@ fetch_direct() {
     sha_url="${SITE_ZIP_SHA_URL:-$SITE_ZIP_URL.sha256}"
     tag="${KIT_TAG:-manual}"
     log "using manually configured SITE_ZIP_URL"
-  elif [[ -f "$SITE_DIR/CLIENT" && -f "$SITE_DIR/index.html" &&
-          -z "${FORCE_FETCH:-}" ]]; then
-    # Site already present (e.g. after a restart); reuse its pinned tag and
-    # avoid the GitHub API entirely. Remove dist/site or set FORCE_FETCH=1 to
-    # re-resolve the newest kit release.
+  elif [[ "${REUSE_SITE:-0}" == "1" && -f "$SITE_DIR/CLIENT" && -f "$SITE_DIR/index.html" ]]; then
+    # Only reuse the pinned tag when explicitly asked (REUSE_SITE=1).
+    # Default is to resolve the newest upstream release on every build.
     tag="$(cat "$SITE_DIR/CLIENT")"
     [[ -n "$tag" && "$tag" != "manual" ]] || return 1
     local base="https://github.com/$KIT/releases/download/$tag"
     zip_url="$base/freerdp-web-page.zip"
     sha_url="$base/freerdp-web-page.zip.sha256"
-    log "reusing existing site (kit: $tag); set FORCE_FETCH=1 to re-resolve"
+    log "reusing existing site (kit: $tag); REUSE_SITE=1"
   else
     tag="$(resolve_kit_tag)" || return 1
     local base="https://github.com/$KIT/releases/download/$tag"
@@ -241,15 +239,6 @@ main() {
   log "Done. Static files in $SITE_DIR:"
   find "$SITE_DIR" -maxdepth 2 -type f | head -20 || true
 
-  # Keep the go:embed source tree in sync for standalone single-file builds.
-  # The runtime patch to app.js (full WSS gateway URL) is preserved.
-  local embed_dir="$ROOT/proxy/site"
-  if [[ "$SITE_DIR" != "$embed_dir" ]]; then
-    log "syncing site into $embed_dir for embedded builds"
-    rm -rf "${embed_dir:?}"
-    mkdir -p "$embed_dir"
-    cp -a "$SITE_DIR/." "$embed_dir/"
-  fi
 }
 
 main "$@"

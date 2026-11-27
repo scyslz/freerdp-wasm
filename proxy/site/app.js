@@ -272,7 +272,10 @@ function hardware(codec) {
   }
   return hwDecoder[codec];
 }
-const hwText = (h) => h === true ? t("info.hardware", "hardware") : h === false ? t("info.software", "software") : t("info.checking", "checking…");
+// "hardware" here is the browser's own answer to isConfigSupported(prefer-hardware), not a decoder
+// it names (a virtual M1 without AV1 hardware answers yes in Firefox), so the word says so (the
+// product owner, 2026-11-26); FreeRDP's own decoder counters keep "info.hardware" below
+const hwText = (h) => h === true ? t("info.hardwareReported", "hardware, as the browser reports") : h === false ? t("info.software", "software") : t("info.checking", "checking…");
 // the codec strings the hardware is asked about: AV1 Main (4:2:0) and H.264 High, as Info does
 const HW = { av1: "av01.0.13M.08", h264: "avc1.640028" };
 const codecEnv = () => ({ av1Hardware: hardware(HW.av1) === true });
@@ -2005,13 +2008,7 @@ const loopbackHost = (h) => /^(127\.\d+\.\d+\.\d+|localhost|\[::1\])$/i.test(h);
 // is on another computer (a plain ws:// to it is blocked there in every browser: mixed content); else
 // ws://. A wss:// gateway needs a certificate the browser trusts for its name (Let's Encrypt), and is
 // the one way in from an iPhone (聪哥, 2026-11-15: freerdp.congzhang.li). Its port is 443 unless given.
-// WASM PoC local workaround: on the "wasm" branch the gateway may be given as a
-// full ws(s):// URL with a path (e.g. wss://host:443/ws). That full URL is passed
-// verbatim to Emscripten's socket layer, so both the fake-DNS table bug
-// (emscripten#27886, PROXY_TO_PTHREAD + gethostbyname) and the /ws path mismatch
-// are bypassed. Plain host:port or scheme-only values keep the original path.
-// Returns FreeRDP's /v: (host:port, no scheme), whether the socket is wss://,
-// and optionally the full WebSocket URL for createPeer.
+// Returns FreeRDP's /v: (host:port, no scheme) and whether the socket is wss://.
 function gatewayRoute(address, direct = false) {
   const a = String(address).trim();
   if (direct) return { host: a, secure: false };
@@ -2061,6 +2058,21 @@ function sessionEnded(unexpected, why = "") {
       ? t("end.mixedLocal", `Safari does not let this https page reach the gateway at ${conn.mixed}: an https page may not open a plain ws:// connection, and Safari, unlike Chrome, Edge and Firefox, makes no exception for 127.0.0.1. A gateway that serves this page too (websockify --web) opens it at http://${localName(conn.mixed)}/, where Safari connects (its saved hosts are its own). Or use Chrome, Edge or Firefox.`, { hop: conn.mixed, local: localName(conn.mixed) })
       : t("end.mixedRemote", `This https page may not open a plain ws:// connection to ${conn.mixed}, in any browser. Reach the gateway through the SSH tunnel at 127.0.0.1 (the safety notice has the command).`, { hop: conn.mixed }), false,
       local ? localPage(conn.mixed) : null);
+    return;
+  }
+  // FreeRDP refused its command line (an Extra option it doesn't take, or two that exclude each
+  // other): the same line fails the same way every time, so no retry; the bar says which option and
+  // FreeRDP's own reason, once (the product owner's spec, 2026-11-26)
+  const badOption = connLog.map((l) => /Command line parsing failed at '([^']*)'/.exec(l)).find(Boolean);
+  if (badOption) {
+    retry.count = 0; endCapture();
+    const reason = [...connLog].reverse().map((l) => /\[ERROR\]\[com\.freerdp\.client\.common\.cmdline\] - \[(?!parse_command_line)[^\]]*\]: (.*)$/.exec(l)).find(Boolean)?.[1] ?? "";
+    // the option as the user typed it: FreeRDP names it without its slash; the separator is each
+    // language's own (a full-width colon in Chinese and Japanese, a no-break space before it in French)
+    const option = /^[/+-]/.test(badOption[1]) ? badOption[1] : "/" + badOption[1];
+    const why = reason ? t("end.reasonSep", ": ") + reason : "";
+    showEnd(t("end.badOption", `FreeRDP refused the option ${option}${why}. Change it in Extra options and connect again.`,
+      { option, reason: why }), false);
     return;
   }
   const passwordRefused = connLog.some((l) => LOGON_FAILED.test(l));

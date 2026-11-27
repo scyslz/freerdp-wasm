@@ -42,10 +42,11 @@ subprotocol and pipes the frames straight to TCP.
    ./build.sh                   # -> dist-release/wsproxy
    ```
 
-   `build.sh` automatically fetches the two prebuilt `.wasm` binaries from the
-   upstream release kit if they are missing (cached under `~/.cache/freerdp-web-poc`,
-   SHA-256 verified). All other frontend assets — including our patched `app.js`
-   — are tracked in this repository, so only the compiled WASM is downloaded.
+   `build.sh` fetches the **latest** upstream release kit into `proxy/site/`
+   (SHA-256 verified), then re-applies our local `app.js` patch automatically.
+   The patched frontend is also committed here as a reference copy. Pin a version
+   with `KIT_TAG=<tag>`, keep the current copy with `SKIP_FETCH=1`, or skip the
+   fetch only with `REUSE_SITE=1`.
 
    The script downloads the release kit's `freerdp-web-page.zip` with `curl`
    (retries + resume), verifies its SHA-256, and unpacks it into `proxy/site/`.
@@ -148,8 +149,8 @@ subprotocol and pipes the frames straight to TCP.
 
 ## Files
 
-- `scripts/fetch-wasm.sh` - downloads only the two prebuilt `.wasm` binaries from the upstream release kit (curl-first, cached, SHA-256 verified)
-- `scripts/fetch-client.sh` - legacy full-kit fetcher (all assets); kept for refreshing the whole frontend
+- `scripts/fetch-client.sh` - fetches the latest upstream release kit (full frontend, curl-first, cached, SHA-256 verified)
+- `scripts/patch-client.sh` - re-applies our WSS-gateway workaround to `app.js` (idempotent; fails loudly if upstream anchors change)
 - `proxy/main.go` - single Go binary: static server + WS↔TCP proxy (stdlib + gorilla/websocket), negotiating websockify's `binary` subprotocol
 - `proxy/Dockerfile` - builds a `FROM scratch` static binary and runs it
 - `scripts/run-poc.sh` - builds the binary (go or docker fallback) and runs it

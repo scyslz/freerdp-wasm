@@ -8,12 +8,12 @@ respective upstream licenses.
 Embedded client (proxy/site/)
 -----------------------------
 Source:    https://github.com/congzhangzh/freerdp-web (Apache-2.0)
-           commit 42e8495371acdd020c10a2f64bb25179c006caf4
+           commit (see proxy/site/MANIFEST for the pinned upstream commit)
 Binary:    https://github.com/congzhangzh/rdp-release-kit
-           release web-20261126.1-b8390ae2807a (freerdp-web-page.zip).
-           The two compiled .wasm files are NOT stored in git; they are fetched
-           from this release by scripts/fetch-wasm.sh at build time (SHA-256
-           verified). All other site assets are tracked here.
+           newest web-* release with freerdp-web-page.zip, resolved at build
+           time by scripts/fetch-client.sh (SHA-256 verified). The patched
+           frontend is committed here as a reference copy; builds refresh it
+           from upstream and re-apply scripts/patch-client.sh.
 License:   Apache License 2.0 — see proxy/site/LICENSE.upstream
 Details:   proxy/site/MANIFEST lists all third-party components and their
            pinned source revisions; their licenses are in proxy/site/licenses/.
@@ -23,8 +23,8 @@ Modifications
 proxy/site/app.js was patched locally to support a full ws(s)://.../ws gateway
 URL (workaround for Emscripten issue #27886 in the prebuilt multi-threaded
 client). The unmodified upstream file is kept as proxy/site/app.js.orig for
-reference. The patch is also reproducible via scripts/fetch-client.sh +
-a small sed (see README).
+reference. The patch is reproducible via scripts/patch-client.sh, which is run
+automatically by build.sh after each upstream refresh.
 
 Go proxy (proxy/main.go, scripts/)
 ----------------------------------
