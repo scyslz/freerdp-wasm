@@ -11,6 +11,14 @@ permissions:
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            artifact: wsproxy-linux-amd64
+          - arch: arm64
+            artifact: wsproxy-linux-arm64
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -22,39 +30,58 @@ jobs:
           go-version: "1.27"
           cache-dependency-path: proxy/go.sum
 
-      - name: Record upstream client version
-        id: upstream
+      - name: Fetch latest frontend and patch (once, shared)
         run: |
-          # build.sh fetches the newest upstream kit and re-applies our patch.
-          # Capture the resulting tag so the release notes say what was built.
-          ./build.sh dist-release/wsproxy
-          echo "tag=$(cat proxy/site/CLIENT)" >> "$GITHUB_OUTPUT"
-          echo "sha=$(sha256sum dist-release/wsproxy | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          echo "size=$(du -h dist-release/wsproxy | cut -f1)" >> "$GITHUB_OUTPUT"
+          ./scripts/fetch-client.sh
+          ./scripts/patch-client.sh
+          echo "tag=$(cat proxy/site/CLIENT)" >> "$GITHUB_ENV"
 
-      - name: Package binary
+      - name: Cross-compile ${{ matrix.arch }}
+        env:
+          GOARCH: ${{ matrix.arch }}
+          GOOS: linux
+          CGO_ENABLED: "0"
         run: |
-          cp dist-release/wsproxy wsproxy-linux-amd64
-          (cd dist-release && sha256sum wsproxy > ../wsproxy-linux-amd64.sha256)
+          mkdir -p dist-release
+          (cd proxy && go build -trimpath -ldflags="-s -w" -o "../dist-release/${{ matrix.artifact }}" .)
+          sha256sum "dist-release/${{ matrix.artifact }}" > "dist-release/${{ matrix.artifact }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist-release/${{ matrix.artifact }}
+            dist-release/${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          # On every push to main, update the rolling "latest" release.
-          # On v* tags, create a versioned release instead.
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'wsproxy latest' }}
           body: |
             Single-file browser RDP proxy binary (Go + embedded FreeRDP WASM client).
 
-            - Upstream client kit: `${{ steps.upstream.outputs.tag }}`
             - Built from commit: `${{ github.sha }}`
-            - Binary SHA-256: `${{ steps.upstream.outputs.sha }}`
-            - Size: `${{ steps.upstream.outputs.size }}`
+            - Assets: linux-amd64, linux-arm64 (statically linked, Go 1.27)
 
-            Run: `./wsproxy-linux-amd64 -listen 0.0.0.0:8180 -target <RDS_HOST>:3389`
+            Run: `./wsproxy-linux-<arch> -listen 0.0.0.0:8180 -target <RDS_HOST>:3389`
           files: |
-            wsproxy-linux-amd64
-            wsproxy-linux-amd64.sha256
+            release-assets/wsproxy-linux-amd64
+            release-assets/wsproxy-linux-amd64.sha256
+            release-assets/wsproxy-linux-arm64
+            release-assets/wsproxy-linux-arm64.sha256
           draft: false
           prerelease: false
