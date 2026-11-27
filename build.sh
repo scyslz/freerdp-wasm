@@ -7,6 +7,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${1:-$ROOT/dist-release/wsproxy}"
 
+# Resolve to an absolute path: go build runs from proxy/, so a relative OUT
+# would otherwise land inside proxy/ instead of the repo root.
+case "$OUT" in
+  /*) ;;
+  *) OUT="$(pwd)/$OUT" ;;
+esac
+
 if ! command -v go >/dev/null 2>&1; then
   echo "[freerdp-wasm] Go toolchain not found in PATH (need >= 1.22)." >&2
   exit 1
